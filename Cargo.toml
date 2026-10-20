@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/play-desktop",
+    "crates/play-core",
+    "crates/play-media",
+    "crates/play-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+egui = "0.36.2"
+egui-wgpu = { version = "0.36.2", features = ["winit", "wayland", "x11"] }
+egui-winit = { version = "0.36.2", default-features = false, features = ["wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+lofty = "0.25"
+pollster = "0.4"
+rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-all"] }
+rfd = "0.17.2"
+ron = "0.8"
+rustfft = "6.4"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+thiserror = "2.0"
+winit = "0.30.13"

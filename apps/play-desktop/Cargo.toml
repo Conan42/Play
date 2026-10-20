@@ -1,0 +1,26 @@
+[package]
+name = "play-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "play"
+path = "src/main.rs"
+
+[dependencies]
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+image.workspace = true
+lofty.workspace = true
+pollster.workspace = true
+play-core = { path = "../../crates/play-core" }
+play-media = { path = "../../crates/play-media" }
+play-ui = { path = "../../crates/play-ui" }
+rfd.workspace = true
+ron.workspace = true
+rodio.workspace = true
+serde.workspace = true
+winit.workspace = true

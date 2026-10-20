@@ -1,0 +1,10 @@
+[package]
+name = "play-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+play-core = { path = "../play-core" }
+serde.workspace = true

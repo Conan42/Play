@@ -1,0 +1,8 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Play workspace tests" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="command" value="test --workspace" />
+    <option name="workingDirectory" value="$PROJECT_DIR$" />
+    <envs />
+    <method v="2" />
+  </configuration>
+</component>

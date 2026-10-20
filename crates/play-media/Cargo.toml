@@ -1,0 +1,11 @@
+[package]
+name = "play-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+image.workspace = true
+rustfft.workspace = true
+thiserror.workspace = true
