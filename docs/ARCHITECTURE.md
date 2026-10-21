@@ -10,7 +10,7 @@ séparés de l'application desktop afin que le modèle et les scènes puissent
 ```mermaid
 flowchart LR
     Core[play-core\nmodèle et transport] --> Desktop[play-desktop]
-    Media[play-media\nimages et FFT] --> Desktop
+    Media[play-media\nimages et analyse audio] --> Desktop
     UI[play-ui\nscènes et panneaux] --> Desktop
     Desktop --> Egui[egui / egui-winit / egui-wgpu]
     Desktop --> Native[winit, rfd, rodio, lofty]
@@ -30,7 +30,7 @@ Cette crate est `no_std` avec `alloc`. Elle définit les contrats partagés :
 - `WorkspaceMode` : `Player`, `RoomAnalyzer` et `UiLab` ;
 - `TransportState` : `Stopped`, `Playing` et `Paused` ;
 - `Track` et `ProjectDocument` pour la session et la liste de pistes ;
-- `SpectrumSnapshot` pour les 32 niveaux et la crête ;
+- `SpectrumSnapshot` pour les niveaux et la crête ;
 - `Workspace` pour regrouper document, transport et spectre.
 
 Elle ne dépend ni d'`egui`, ni de `wgpu`, ni d'une API audio système.
@@ -41,8 +41,8 @@ Cette crate contient le traitement média indépendant de l'interface. Elle
 fournit actuellement :
 
 - `inspect_image`, qui valide une image et expose ses dimensions RGBA ;
-- `SpectrumAnalyzer`, qui applique une fenêtre de Hann, calcule une FFT et
-  normalise le résultat en 32 bandes logarithmiques.
+- `SpectrumAnalyzer`, qui calcule 64 niveaux d'amplitude sur des portions
+  temporelles du bloc audio, comme l'analyseur du Player d'Exec Modernisé.
 
 Le sample rate actuel du desktop est de 48 kHz. Les entrées audio et les
 décodeurs restent à intégrer.
@@ -61,7 +61,7 @@ flowchart TB
     Main[Zone centrale]
     Tracks[Liste Pistes\nhauteur flexible et défilement]
     Info[Informations piste\net jaquette]
-    Spectrum[Analyseur spectral\nhauteur fixe 180 px, ancré en bas]
+    Spectrum[Analyseur spectral stéréo\n64 bandes superposées, ancré en bas]
     Stereo[Mètres LED stéréo\ngraduation dB et faders L/R]
     Toolbar --> Main
     Main --> Tracks
@@ -117,8 +117,8 @@ cargo test --workspace
 cargo fmt --all -- --check
 ```
 
-Les tests actuels vérifient la transition du transport et la production des 32
-bandes spectrales. La prochaine couche de tests devra couvrir le décodage,
+Les tests actuels vérifient la transition du transport et la production des 64
+niveaux d'amplitude stéréo. La prochaine couche de tests devra couvrir le décodage,
 l'audio réel et la persistance des sessions.
 
 ## Évolutions prévues

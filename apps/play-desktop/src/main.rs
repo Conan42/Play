@@ -14,7 +14,7 @@ use egui_winit::State;
 use lofty::picture::PictureType;
 use lofty::prelude::*;
 use play_core::{Track, TransportState, Workspace, WorkspaceMode};
-use play_media::SpectrumAnalyzer;
+use play_media::{SPECTRUM_BANDS, SpectrumAnalyzer};
 use play_ui::Scene;
 use rodio::Source;
 use winit::application::ApplicationHandler;
@@ -23,25 +23,24 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 const SPECTRUM_HEIGHT: f32 = 250.0;
-const SPECTRUM_LED_ROWS: usize = 32;
 const CONTENT_GAP: f32 = 12.0;
 const TRACK_LIST_INNER_MARGIN: f32 = 16.0;
 const TRACK_INFO_HEIGHT: f32 = 124.0;
 const TRACK_ROW_HEIGHT: f32 = 52.0;
 const LED_COUNT: usize = 24;
-const SPECTRUM_WINDOW_FRAMES: usize = 8192;
+const SPECTRUM_WINDOW_FRAMES: usize = 512;
 const ANALYSIS_BUFFER_FRAMES: usize = 16384;
-const SPECTRUM_FREQUENCY_LABELS: [(f32, &str); 10] = [
-    (20.0, "20 Hz"),
-    (50.0, "50 Hz"),
-    (100.0, "100 Hz"),
-    (200.0, "200 Hz"),
-    (500.0, "500 Hz"),
-    (1_000.0, "1 kHz"),
-    (2_000.0, "2 kHz"),
-    (5_000.0, "5 kHz"),
-    (10_000.0, "10 kHz"),
-    (20_000.0, "20 kHz"),
+const SPECTRUM_FREQUENCY_LABELS: [(usize, &str); 10] = [
+    (0, "20 Hz"),
+    (13, "50"),
+    (23, "100"),
+    (33, "200"),
+    (47, "500"),
+    (56, "1 kHz"),
+    (66, "2 kHz"),
+    (80, "5 kHz"),
+    (90, "10 kHz"),
+    (100, "20 kHz"),
 ];
 
 const MODE_BUTTONS: [(WorkspaceMode, &str, &str); 3] = [
@@ -413,7 +412,7 @@ struct PlayDesktop {
     channel_gains: Arc<Mutex<[f32; 2]>>,
     analysis_buffer: Option<Arc<Mutex<LiveAnalysisBuffer>>>,
     channel_levels: [f32; 2],
-    stereo_spectrum: [[f32; 32]; 2],
+    stereo_spectrum: [[f32; SPECTRUM_BANDS]; 2],
     toolbar_textures: ToolbarTextures,
 }
 
@@ -456,7 +455,7 @@ impl PlayDesktop {
             channel_gains: Arc::new(Mutex::new([0.251_188_64; 2])),
             analysis_buffer: None,
             channel_levels: [0.0; 2],
-            stereo_spectrum: [[0.0; 32]; 2],
+            stereo_spectrum: [[0.0; SPECTRUM_BANDS]; 2],
             toolbar_textures,
         };
         app.restore_playlist();
@@ -514,45 +513,66 @@ impl PlayDesktop {
 
         let content = rect.shrink2(vec2(8.0, 6.0));
         let frequency_height = 20.0;
-        let channel_gap = 5.0;
-        let channel_height = ((content.height() - frequency_height - channel_gap) * 0.5).max(1.0);
-        let channel_width = content.width().max(1.0);
-        let channel_names = ["L", "R"];
+        let graph = egui::Rect::from_min_max(
+            egui::pos2(content.left() + 22.0, content.top()),
+            egui::pos2(content.right(), content.bottom() - frequency_height),
+        );
+        painter.rect_filled(graph, 0.0, Color32::from_rgb(24, 38, 49));
+        let axis_y = graph.center().y;
+        painter.line_segment(
+            [egui::pos2(graph.left(), axis_y), egui::pos2(graph.right(), axis_y)],
+            egui::Stroke::new(1.0, Color32::from_rgb(65, 74, 84)),
+        );
+        painter.text(
+            egui::pos2(content.left(), graph.center().y - graph.height() * 0.25),
+            egui::Align2::LEFT_CENTER,
+            "L",
+            FontId::proportional(11.0),
+            Color32::from_rgb(67, 183, 213),
+        );
+        painter.text(
+            egui::pos2(content.left(), graph.center().y + graph.height() * 0.25),
+            egui::Align2::LEFT_CENTER,
+            "R",
+            FontId::proportional(11.0),
+            Color32::from_rgb(117, 97, 200),
+        );
 
-        for channel in 0..2 {
-            let top = content.top() + channel as f32 * (channel_height + channel_gap);
-            let channel_rect = egui::Rect::from_min_size(
-                egui::pos2(content.left(), top),
-                vec2(channel_width, channel_height),
-            );
-            painter.text(
-                egui::pos2(channel_rect.left(), channel_rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                channel_names[channel],
-                FontId::proportional(11.0),
-                Color32::from_gray(165),
-            );
-
-            let led_rect = egui::Rect::from_min_max(
-                egui::pos2(channel_rect.left() + 22.0, channel_rect.top()),
-                channel_rect.right_bottom(),
-            );
-            Self::draw_spectrum_channel(
-                &painter,
-                led_rect,
-                &self.stereo_spectrum[channel],
-                channel == 1,
-            );
+        let band_width = graph.width() / SPECTRUM_BANDS as f32;
+        let bar_width = (band_width - 1.0).max(1.0);
+        let maximum_height = (graph.height() * 0.5 - 1.0).max(1.0);
+        for band in 0..SPECTRUM_BANDS {
+            let x = graph.left() + band as f32 * band_width;
+            let left_height = self.stereo_spectrum[0][band].clamp(0.0, 1.0) * maximum_height;
+            let right_height = self.stereo_spectrum[1][band].clamp(0.0, 1.0) * maximum_height;
+            if left_height > 0.0 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, axis_y - left_height),
+                        egui::pos2(x + bar_width, axis_y),
+                    ),
+                    0.0,
+                    Color32::from_rgb(67, 183, 213),
+                );
+            }
+            if right_height > 0.0 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, axis_y),
+                        egui::pos2(x + bar_width, axis_y + right_height),
+                    ),
+                    0.0,
+                    Color32::from_rgb(117, 97, 200),
+                );
+            }
         }
 
         let frequency_rect = egui::Rect::from_min_max(
             egui::pos2(content.left() + 22.0, content.bottom() - frequency_height),
             content.right_bottom(),
         );
-        let min_log = 20.0_f32.log2();
-        let log_span = 20_000.0_f32.log2() - min_log;
-        for (frequency, label) in SPECTRUM_FREQUENCY_LABELS {
-            let normalized = (frequency.log2() - min_log) / log_span;
+        for (percent, label) in SPECTRUM_FREQUENCY_LABELS {
+            let normalized = percent as f32 / 100.0;
             let x = egui::lerp(frequency_rect.left()..=frequency_rect.right(), normalized);
             painter.line_segment(
                 [egui::pos2(x, frequency_rect.top()), egui::pos2(x, frequency_rect.top() + 4.0)],
@@ -565,45 +585,6 @@ impl PlayDesktop {
                 FontId::proportional(9.0),
                 Color32::from_gray(160),
             );
-        }
-    }
-
-    fn draw_spectrum_channel(
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        bands: &[f32; 32],
-        inverted: bool,
-    ) {
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(16, 32, 35));
-        let band_width = rect.width() / bands.len() as f32;
-        let led_height = rect.height() / SPECTRUM_LED_ROWS as f32;
-
-        for (band_index, level) in bands.iter().copied().enumerate() {
-            let active_rows = (level.clamp(0.0, 1.0) * SPECTRUM_LED_ROWS as f32).ceil() as usize;
-            let x = rect.left() + band_index as f32 * band_width;
-            for row in 0..SPECTRUM_LED_ROWS {
-                let y = rect.bottom() - (row as f32 + 1.0) * led_height;
-                let led = egui::Rect::from_min_max(
-                    egui::pos2(x + 1.0, y + 0.7),
-                    egui::pos2(x + band_width - 1.0, y + led_height - 0.7),
-                );
-                let level_row = if inverted { SPECTRUM_LED_ROWS - 1 - row } else { row };
-                let active = if inverted {
-                    row >= SPECTRUM_LED_ROWS - active_rows
-                } else {
-                    row < active_rows
-                };
-                let color = if level_row >= SPECTRUM_LED_ROWS - 4 {
-                    if active { Color32::RED } else { Color32::from_rgb(58, 25, 30) }
-                } else if level_row >= SPECTRUM_LED_ROWS - 9 {
-                    if active { Color32::YELLOW } else { Color32::from_rgb(62, 57, 26) }
-                } else if active {
-                    Color32::from_rgb(72, 210, 166)
-                } else {
-                    Color32::from_rgb(27, 67, 64)
-                };
-                painter.rect_filled(led, 0.0, color);
-            }
         }
     }
 
@@ -1189,7 +1170,7 @@ impl PlayDesktop {
         self.audio_metadata = None;
         self.metadata_loading = None;
         self.channel_levels = [0.0; 2];
-        self.stereo_spectrum = [[0.0; 32]; 2];
+        self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
         self.workspace.stop();
         self.workspace.spectrum = Default::default();
     }
@@ -1207,7 +1188,7 @@ impl PlayDesktop {
         self.audio_metadata = None;
         self.metadata_loading = None;
         self.channel_levels = [0.0; 2];
-        self.stereo_spectrum = [[0.0; 32]; 2];
+        self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
         self.workspace.stop();
         self.audio_error = None;
 
@@ -1360,13 +1341,18 @@ impl PlayDesktop {
             self.stereo_spectrum = stereo_bands;
             let mut bands = [0.0; 32];
             for (index, band) in bands.iter_mut().enumerate() {
-                *band = (stereo_bands[0][index] + stereo_bands[1][index]) * 0.5;
+                let first = index * 2;
+                *band = (stereo_bands[0][first]
+                    + stereo_bands[0][first + 1]
+                    + stereo_bands[1][first]
+                    + stereo_bands[1][first + 1])
+                    * 0.25;
             }
             self.workspace.spectrum.bands = bands;
             self.workspace.spectrum.peak = bands.iter().copied().fold(0.0, f32::max);
             self.channel_levels = channel_levels;
         } else {
-            self.stereo_spectrum = [[0.0; 32]; 2];
+            self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
             self.workspace.spectrum = Default::default();
             self.channel_levels = [0.0; 2];
         }

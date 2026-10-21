@@ -25,8 +25,9 @@ session démarre avec une liste de pistes vide et propose :
 - une liste de pistes qui occupe l'espace disponible et défile lorsqu'elle
   devient trop longue, avec une sélection visuelle de la piste active ;
 - une zone d'informations après la liste, avec la jaquette intégrée aux FLAC ;
-- un analyseur spectral ancré dans la partie basse de la fenêtre, avec 32
-  bandes normalisées calculées sur la piste en cours ;
+- un analyseur spectral stéréo ancré dans la partie basse de la fenêtre, avec
+  64 bandes d'amplitude superposées autour d'un axe central, comme le Player
+  d'Exec Modernisé ;
 - un double mètre stéréo à LED rondes, gradué en décibels, et deux faders L/R
   sur toute la hauteur du panneau droit, placés contre leur mètre respectif.
 
@@ -40,7 +41,7 @@ de lecture.
 ```text
 apps/play-desktop/       fenêtre native, toolbar et composition egui
 crates/play-core/        document, pistes, transport et état du spectre
-crates/play-media/       inspection d'images et analyse FFT
+crates/play-media/       inspection d'images et analyse spectrale stéréo
 crates/play-ui/          scènes et contrats de panneaux portables
 assets/fonts/             polices FreeSans et Material Icons
 assets/texture/           textures des boutons de la barre d'outils
@@ -57,7 +58,7 @@ docs/                     architecture et décisions du projet
 | Modèle | `serde` | actif | contrats sérialisables dans `play-core` et `play-ui` |
 | Images | `image` | actif | textures PNG et inspection RGBA |
 | Métadonnées | `lofty` | actif | lecture des jaquettes intégrées aux FLAC |
-| Analyse | `rustfft` | actif | analyse spectrale en 32 bandes |
+| Analyse | traitement temporel | actif | analyse stéréo en 64 bandes |
 | Sélection de fichiers | `rfd` | actif | fenêtre native de chargement des musiques |
 | Audio | `rodio` + `cpal` + `symphonia` | actif | décodage et lecture des fichiers |
 | Rééchantillonnage | `rubato` | prévu | adaptation des flux audio |
