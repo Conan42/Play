@@ -991,8 +991,8 @@ impl PlayDesktop {
 
     fn draw_led_meter(ui: &mut Ui, level: f32, height: f32) {
         ui.vertical(|ui| {
-            ui.set_width(30.0);
-            let (response, painter) = ui.allocate_painter(vec2(30.0, height), egui::Sense::hover());
+            ui.set_width(24.0);
+            let (response, painter) = ui.allocate_painter(vec2(24.0, height), egui::Sense::hover());
             let rect = response.rect;
             let step = rect.height() / LED_COUNT as f32;
             let radius = (rect.width() * 0.32).min(step * 0.34);
@@ -1019,18 +1019,15 @@ impl PlayDesktop {
 
     fn draw_decibel_scale(ui: &mut Ui, height: f32) {
         ui.vertical(|ui| {
-            ui.set_width(38.0);
-            let (response, painter) = ui.allocate_painter(vec2(38.0, height), egui::Sense::hover());
+            ui.set_width(32.0);
+            let (response, painter) = ui.allocate_painter(vec2(32.0, height), egui::Sense::hover());
             let rect = response.rect;
             for decibels in [0, -6, -12, -18, -24, -36, -48, -60] {
                 let normalized = (decibels as f32 + 60.0) / 60.0;
                 let y = rect.bottom() - normalized * rect.height();
-                painter.line_segment(
-                    [egui::pos2(rect.left(), y), egui::pos2(rect.left() + 8.0, y)],
-                    egui::Stroke::new(1.0, Color32::from_gray(150)),
-                );
+                let y = y.clamp(rect.top() + 6.0, rect.bottom() - 6.0);
                 painter.text(
-                    egui::pos2(rect.left() + 10.0, y),
+                    egui::pos2(rect.left() + 2.0, y),
                     egui::Align2::LEFT_CENTER,
                     format!("{decibels}"),
                     FontId::proportional(10.0),
@@ -1043,9 +1040,9 @@ impl PlayDesktop {
     fn draw_stereo_fader(ui: &mut Ui, height: f32, value: &mut f32) -> egui::Rect {
         let mut fader_rect = egui::Rect::NOTHING;
         ui.vertical(|ui| {
-            ui.set_width(42.0);
+            ui.set_width(34.0);
             let (response, painter) =
-                ui.allocate_painter(vec2(42.0, height), Sense::click_and_drag());
+                ui.allocate_painter(vec2(34.0, height), Sense::click_and_drag());
             let rect = response.rect;
             fader_rect = rect;
             let track = egui::Rect::from_center_size(
@@ -1061,7 +1058,7 @@ impl PlayDesktop {
             let knob_y = track.bottom() - *value * track.height();
             let knob = egui::Rect::from_center_size(
                 egui::pos2(track.center().x, knob_y),
-                vec2(32.0, 12.0),
+                vec2(26.0, 12.0),
             );
             painter.rect_filled(knob, 3.0, Color32::from_rgb(180, 184, 190));
             painter.rect_stroke(
@@ -1086,7 +1083,7 @@ impl PlayDesktop {
     }
 
     fn draw_stereo_meter_panel(&mut self, ui: &mut Ui) {
-        ui.set_min_width(204.0);
+        ui.set_min_width(174.0);
         let meter_height = (ui.available_height() - 8.0).max(220.0);
         let levels = [
             (self.channel_levels[0] * Self::fader_to_gain(self.stereo_faders[0])).clamp(0.0, 1.0),
@@ -1444,7 +1441,7 @@ impl PlayDesktop {
             .show(root_ui, |ui| {
                 self.draw_toolbar(ui);
             });
-        egui::Panel::right("stereo_meter").exact_size(220.0).show(root_ui, |ui| {
+        egui::Panel::right("stereo_meter").exact_size(190.0).show(root_ui, |ui| {
             self.draw_stereo_meter_panel(ui);
         });
         egui::CentralPanel::default().show(root_ui, |ui| {
