@@ -989,10 +989,9 @@ impl PlayDesktop {
         }
     }
 
-    fn draw_led_meter(ui: &mut Ui, label: &str, level: f32, height: f32) {
+    fn draw_led_meter(ui: &mut Ui, level: f32, height: f32) {
         ui.vertical(|ui| {
             ui.set_width(30.0);
-            ui.label(label);
             let (response, painter) = ui.allocate_painter(vec2(30.0, height), egui::Sense::hover());
             let rect = response.rect;
             let step = rect.height() / LED_COUNT as f32;
@@ -1021,7 +1020,6 @@ impl PlayDesktop {
     fn draw_decibel_scale(ui: &mut Ui, height: f32) {
         ui.vertical(|ui| {
             ui.set_width(38.0);
-            ui.label("dB");
             let (response, painter) = ui.allocate_painter(vec2(38.0, height), egui::Sense::hover());
             let rect = response.rect;
             for decibels in [0, -6, -12, -18, -24, -36, -48, -60] {
@@ -1042,11 +1040,10 @@ impl PlayDesktop {
         });
     }
 
-    fn draw_stereo_fader(ui: &mut Ui, label: &str, height: f32, value: &mut f32) -> egui::Rect {
+    fn draw_stereo_fader(ui: &mut Ui, height: f32, value: &mut f32) -> egui::Rect {
         let mut fader_rect = egui::Rect::NOTHING;
         ui.vertical(|ui| {
             ui.set_width(42.0);
-            ui.label(label);
             let (response, painter) =
                 ui.allocate_painter(vec2(42.0, height), Sense::click_and_drag());
             let rect = response.rect;
@@ -1074,7 +1071,7 @@ impl PlayDesktop {
                 egui::StrokeKind::Inside,
             );
             let decibels = if *value > 0.0 { -60.0 + *value * 60.0 } else { -60.0 };
-            ui.label(format!("{decibels:.0} dB"));
+            ui.label(format!("{decibels:.0}"));
         });
         fader_rect
     }
@@ -1090,9 +1087,7 @@ impl PlayDesktop {
 
     fn draw_stereo_meter_panel(&mut self, ui: &mut Ui) {
         ui.set_min_width(204.0);
-        ui.heading("Stereo");
-        ui.separator();
-        let meter_height = (ui.available_height() - 56.0).max(220.0);
+        let meter_height = (ui.available_height() - 8.0).max(220.0);
         let levels = [
             (self.channel_levels[0] * Self::fader_to_gain(self.stereo_faders[0])).clamp(0.0, 1.0),
             (self.channel_levels[1] * Self::fader_to_gain(self.stereo_faders[1])).clamp(0.0, 1.0),
@@ -1100,12 +1095,10 @@ impl PlayDesktop {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             Self::draw_decibel_scale(ui, meter_height);
-            Self::draw_led_meter(ui, "L", levels[0], meter_height);
-            let left_fader =
-                Self::draw_stereo_fader(ui, "L", meter_height, &mut self.stereo_faders[0]);
-            let right_fader =
-                Self::draw_stereo_fader(ui, "R", meter_height, &mut self.stereo_faders[1]);
-            Self::draw_led_meter(ui, "R", levels[1], meter_height);
+            Self::draw_led_meter(ui, levels[0], meter_height);
+            let left_fader = Self::draw_stereo_fader(ui, meter_height, &mut self.stereo_faders[0]);
+            let right_fader = Self::draw_stereo_fader(ui, meter_height, &mut self.stereo_faders[1]);
+            Self::draw_led_meter(ui, levels[1], meter_height);
 
             let middle = egui::Rect::from_min_max(
                 egui::pos2(left_fader.right() - 10.0, left_fader.top()),
