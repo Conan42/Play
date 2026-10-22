@@ -27,7 +27,7 @@ de fichiers et les interactions de la toolbar.
 
 Cette crate est `no_std` avec `alloc`. Elle définit les contrats partagés :
 
-- `WorkspaceMode` : `Player`, `RoomAnalyzer` et `UiLab` ;
+- `WorkspaceMode` : `Player`, `RoomAnalyzer`, `LiveTablature` et `UiLab` ;
 - `TransportState` : `Stopped`, `Playing` et `Paused` ;
 - `Track` et `ProjectDocument` pour la session et la liste de pistes ;
 - `SpectrumSnapshot` pour les niveaux et la crête ;
@@ -41,11 +41,19 @@ Cette crate contient le traitement média indépendant de l'interface. Elle
 fournit actuellement :
 
 - `inspect_image`, qui valide une image et expose ses dimensions RGBA ;
-- `SpectrumAnalyzer`, qui calcule 64 niveaux d'amplitude sur des portions
-  temporelles du bloc audio, comme l'analyseur du Player d'Exec Modernisé.
+- `SpectrumAnalyzer`, qui calcule 64 niveaux d'amplitude stéréo sur des
+  portions temporelles du bloc audio, comme l'analyseur du Player d'Exec
+  Modernisé ;
+- `analyze_with_band_count`, qui permet au Room Analyzer d'utiliser 256 bandes
+  mono avec une résolution fréquentielle supérieure ;
+- `detect_pitch`, qui estime la fréquence fondamentale, la note MIDI et les
+  cents ;
+- `detect_chord`, qui estime la fondamentale et la qualité d'un accord à partir
+  de l'énergie chromatique.
 
-Le sample rate actuel du desktop est de 48 kHz. Les entrées audio et les
-décodeurs restent à intégrer.
+Le sample rate et le nombre de canaux sont récupérés dans la configuration de
+l'entrée ou du fichier audio. Les flux microphone et les décodeurs sont
+assemblés dans `play-desktop` autour des buffers d'analyse.
 
 ### `play-ui`
 
@@ -82,6 +90,52 @@ tandis que les informations restent juste sous la liste et le spectre dans la
 partie basse. Le panneau droit conserve toute la hauteur disponible pour les
 mètres LED et les faders stéréo.
 
+## Room Analyzer
+
+Le Room Analyzer ouvre un flux d'entrée avec `rodio::microphone` et le place
+dans un buffer partagé avec la boucle d'interface. À chaque image, le desktop
+extrait la fenêtre audio la plus récente, la convertit en mono et la transmet à
+`SpectrumAnalyzer::analyze_with_band_count` avec 256 bandes.
+
+Les niveaux sont affichés positivement sur une échelle de 0 à 110 dB, de 16 Hz
+à 23 kHz, et le graphe occupe toute la zone centrale du mode. Le choix de
+l'entrée et les erreurs d'ouverture sont affichés au-dessus du graphe.
+
+## Live Tablature
+
+Le Live Tablature réutilise le même flux d'entrée et la même fenêtre d'analyse.
+La détection de hauteur produit une note MIDI, puis `guitar_position` choisit
+la position la plus grave disponible sur les six cordes dans les vingt
+premières cases. Une détection d'accord est affichée dans l'en-tête.
+
+Les positions reconnues sont ajoutées à une file temporelle limitée. Les
+portées sont dessinées avec six lignes (`e B G D A E`) et répétées selon la
+hauteur disponible. La durée visible d'une portée dépend de sa largeur, ce
+qui permet d'afficher davantage de notes lorsque la fenêtre est agrandie.
+`Play/Pause` suspend ou reprend le défilement et l'ajout de notes, tandis que
+`Enregistrer les notes` contrôle séparément la capture des positions détectées.
+Les contrôles pédagogiques comprennent les onglets `TABLATURE` et
+`STRUMMING`, le choix de mode, le BPM, la mesure, le métronome, les exercices
+et l'effacement de la tablature.
+
+Le flux actuel est audio. La connexion MIDI directe, la lecture d'un exercice
+enregistré et la génération sonore du métronome sont des extensions à prévoir.
+
+```mermaid
+sequenceDiagram
+    actor Guitariste
+    participant Input as Microphone / entrée audio
+    participant Buffer as LiveAnalysisBuffer
+    participant Media as play-media
+    participant Tab as LiveTablature
+
+    Guitariste->>Input: joue une note ou un accord
+    Input->>Buffer: pousse les échantillons
+    Buffer->>Media: extrait la fenêtre récente
+    Media->>Tab: fréquence, note, position et accord
+    Tab->>Tab: ajoute la note et fait défiler la portée
+```
+
 ## Flux de chargement des musiques
 
 ```mermaid
@@ -117,12 +171,13 @@ cargo test --workspace
 cargo fmt --all -- --check
 ```
 
-Les tests actuels vérifient la transition du transport et la production des 64
-niveaux d'amplitude stéréo. La prochaine couche de tests devra couvrir le décodage,
-l'audio réel et la persistance des sessions.
+Les tests actuels vérifient la transition du transport, les niveaux
+d'amplitude, la résolution des basses fréquences, la détection de hauteur et
+la détection d'accord. La prochaine couche de tests devra couvrir le décodage,
+l'audio réel, la file temporelle de tablature et la persistance des sessions.
 
 ## Évolutions prévues
 
-1. ajouter `ron` pour sauvegarder et recharger une session ;
-2. extraire les composants Player, RoomAnalyzer et UiLab partageables ;
+1. ajouter la connexion MIDI directe et la lecture d'exercices enregistrés ;
+2. extraire les composants Player, RoomAnalyzer et LiveTablature partageables ;
 3. valider les chemins de packaging des trois plateformes.

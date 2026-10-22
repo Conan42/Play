@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use egui::{
     Color32, Context, CornerRadius, FontDefinitions, FontFamily, FontId, Frame, RichText, Sense,
@@ -14,9 +15,10 @@ use egui_winit::State;
 use lofty::picture::PictureType;
 use lofty::prelude::*;
 use play_core::{Track, TransportState, Workspace, WorkspaceMode};
-use play_media::{SPECTRUM_BANDS, SpectrumAnalyzer};
+use play_media::{ChordEstimate, ChordQuality, PitchEstimate, SPECTRUM_BANDS, SpectrumAnalyzer};
 use play_ui::Scene;
 use rodio::Source;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -24,28 +26,37 @@ use winit::window::{Window, WindowId};
 
 const SPECTRUM_HEIGHT: f32 = 250.0;
 const CONTENT_GAP: f32 = 12.0;
+const PLAYER_CONTENT_GAP: f32 = 8.0;
 const TRACK_LIST_INNER_MARGIN: f32 = 16.0;
-const TRACK_INFO_HEIGHT: f32 = 124.0;
-const TRACK_ROW_HEIGHT: f32 = 52.0;
+const TRACK_INFO_HEIGHT: f32 = 152.0;
+const TRACK_HEADER_HEIGHT: f32 = 22.0;
+const TRACK_ROW_HEIGHT: f32 = 26.0;
+const TRACK_COLUMN_COUNT: usize = 8;
 const LED_COUNT: usize = 24;
-const SPECTRUM_WINDOW_FRAMES: usize = 512;
+const SPECTRUM_WINDOW_FRAMES: usize = 16_384;
+const PITCH_WINDOW_FRAMES: usize = 4_096;
+const ROOM_SPECTRUM_BANDS: usize = 256;
 const ANALYSIS_BUFFER_FRAMES: usize = 16384;
+const TABLATURE_NOTE_REPEAT_SECONDS: f32 = 0.35;
+const TABLATURE_NOTE_SPACING_PX: f32 = 46.0;
+const TABLATURE_HISTORY_LIMIT: usize = 256;
 const SPECTRUM_FREQUENCY_LABELS: [(usize, &str); 10] = [
-    (0, "20 Hz"),
-    (13, "50"),
-    (23, "100"),
-    (33, "200"),
+    (0, "16 Hz"),
+    (16, "50"),
+    (25, "100"),
+    (35, "200"),
     (47, "500"),
-    (56, "1 kHz"),
+    (57, "1 kHz"),
     (66, "2 kHz"),
-    (80, "5 kHz"),
-    (90, "10 kHz"),
-    (100, "20 kHz"),
+    (79, "5 kHz"),
+    (89, "10 kHz"),
+    (100, "23 kHz"),
 ];
 
-const MODE_BUTTONS: [(WorkspaceMode, &str, &str); 3] = [
+const MODE_BUTTONS: [(WorkspaceMode, &str, &str); 4] = [
     (WorkspaceMode::Player, "Player", "\u{e405}"),
     (WorkspaceMode::RoomAnalyzer, "Room analyzer", "\u{e01d}"),
+    (WorkspaceMode::LiveTablature, "Live Tablature", "\u{e8b0}"),
     (WorkspaceMode::UiLab, "UI lab", "\u{e871}"),
 ];
 
@@ -90,11 +101,113 @@ fn setup_fonts(ctx: &Context) {
 struct ToolbarTextures {
     normal: TextureHandle,
     pressed: TextureHandle,
+    menu_normal: TextureHandle,
+    menu_pressed: TextureHandle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepeatMode {
+    Track,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChainMode {
+    Normal,
+    VolumeFader,
+    TempoFader,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+enum TrackColumn {
+    Number,
+    Title,
+    Artist,
+    Album,
+    Year,
+    Duration,
+    Format,
+    File,
+}
+
+impl TrackColumn {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Number => "#",
+            Self::Title => "Titre",
+            Self::Artist => "Artiste",
+            Self::Album => "Album",
+            Self::Year => "Année",
+            Self::Duration => "Durée",
+            Self::Format => "Format",
+            Self::File => "Fichier",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Number => 0,
+            Self::Title => 1,
+            Self::Artist => 2,
+            Self::Album => 3,
+            Self::Year => 4,
+            Self::Duration => 5,
+            Self::Format => 6,
+            Self::File => 7,
+        }
+    }
+
+    fn default_order() -> Vec<Self> {
+        vec![
+            Self::Number,
+            Self::Title,
+            Self::Artist,
+            Self::Album,
+            Self::Year,
+            Self::Duration,
+            Self::Format,
+            Self::File,
+        ]
+    }
+
+    fn default_visibility() -> [bool; TRACK_COLUMN_COUNT] {
+        [true, true, true, true, true, true, true, false]
+    }
+
+    fn width(self) -> f32 {
+        match self {
+            Self::Number => 48.0,
+            Self::Title => 250.0,
+            Self::Artist => 180.0,
+            Self::Album => 190.0,
+            Self::Year => 72.0,
+            Self::Duration => 82.0,
+            Self::Format => 210.0,
+            Self::File => 240.0,
+        }
+    }
+
+    fn alignment(self) -> egui::Align {
+        match self {
+            Self::Title | Self::Artist | Self::Album | Self::File => egui::Align::Min,
+            Self::Number | Self::Year | Self::Duration | Self::Format => egui::Align::Center,
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct SavedPlaylist {
     paths: Vec<String>,
+    #[serde(default)]
+    column_order: Vec<TrackColumn>,
+    #[serde(default)]
+    visible_columns: Vec<TrackColumn>,
+    #[serde(default)]
+    layout_version: u32,
+    #[serde(default)]
+    selected_track: Option<usize>,
+    #[serde(default)]
+    position_seconds: f32,
 }
 
 fn playlist_storage_path() -> Option<PathBuf> {
@@ -112,9 +225,20 @@ struct LiveAnalysisBuffer {
     sample_rate: f32,
 }
 
+#[derive(Clone, Copy)]
+struct TablatureNote {
+    recorded_at: Instant,
+    line: usize,
+    fret: u8,
+}
+
 #[derive(Clone)]
 struct AudioMetadata {
     format: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    year: Option<u16>,
     bit_depth: Option<u8>,
     sample_rate: u32,
     channels: usize,
@@ -289,6 +413,10 @@ fn basic_audio_metadata(
         .unwrap_or_else(|| "AUDIO".to_owned());
     AudioMetadata {
         format,
+        title: None,
+        artist: None,
+        album: None,
+        year: None,
         bit_depth: None,
         sample_rate,
         channels,
@@ -309,6 +437,13 @@ fn read_audio_metadata(
 
     if let Ok(tagged_file) = lofty::read_from_path(path) {
         let properties = tagged_file.properties();
+        metadata.title =
+            tagged_file.tags().iter().find_map(|tag| tag.title().map(|value| value.into_owned()));
+        metadata.artist =
+            tagged_file.tags().iter().find_map(|tag| tag.artist().map(|value| value.into_owned()));
+        metadata.album =
+            tagged_file.tags().iter().find_map(|tag| tag.album().map(|value| value.into_owned()));
+        metadata.year = tagged_file.tags().iter().find_map(|tag| tag.date().map(|date| date.year));
         metadata.bit_depth = properties.bit_depth();
         metadata.bitrate_kbps = properties.audio_bitrate();
         metadata.bpm = tagged_file.tags().iter().find_map(|tag| {
@@ -323,6 +458,21 @@ fn read_audio_metadata(
     }
 
     metadata
+}
+
+fn load_track_metadata(path: &Path) -> AudioMetadata {
+    let mut sample_rate = 0;
+    let mut channels = 0;
+    let mut duration_seconds = 0.0;
+    if let Ok(file) = std::fs::File::open(path)
+        && let Ok(decoder) = rodio::Decoder::try_from(file)
+    {
+        sample_rate = decoder.sample_rate().get();
+        channels = decoder.channels().get() as usize;
+        duration_seconds =
+            decoder.total_duration().map(|duration| duration.as_secs_f32()).unwrap_or(0.0);
+    }
+    read_audio_metadata(path, sample_rate, channels, duration_seconds)
 }
 
 fn toolbar_icon_button(
@@ -369,6 +519,46 @@ fn toolbar_icon_button_with_font(
     response.on_hover_text(tooltip)
 }
 
+fn toolbar_menu_button(
+    ui: &mut Ui,
+    textures: &ToolbarTextures,
+    icon: &str,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(82.0, 38.0), Sense::click());
+    let popup_id = egui::Popup::default_response_id(&response);
+    let active = response.hovered()
+        || response.is_pointer_button_down_on()
+        || egui::Popup::is_id_open(ui.ctx(), popup_id);
+    let icon_color = if active { Color32::YELLOW } else { Color32::WHITE };
+    let icon_rect =
+        egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + 58.0, rect.bottom()));
+    let arrow_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.left() + 58.0, rect.top()), rect.right_bottom());
+    let texture = if active { &textures.menu_pressed } else { &textures.menu_normal };
+    ui.painter().image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    ui.painter().text(
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        FontId::new(20.0, FontFamily::Name("material_icons".into())),
+        icon_color,
+    );
+    ui.painter().text(
+        arrow_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "▼",
+        FontId::new(10.0, FontFamily::Proportional),
+        icon_color,
+    );
+    response.on_hover_text(tooltip)
+}
+
 fn toolbar_separator(ui: &mut Ui) {
     ui.add_space(2.0);
     ui.separator();
@@ -397,22 +587,54 @@ struct PlayDesktop {
     painter: Option<Painter>,
     workspace: Workspace,
     scene: Scene,
-    transport_options: [bool; 2],
+    repeat_mode: Option<RepeatMode>,
+    chain_mode: Option<ChainMode>,
+    chain_transition_seconds: f32,
     show_music_loader: bool,
     loaded_music: Vec<PathBuf>,
     track_covers: Vec<Option<TextureHandle>>,
     track_cover_checked: Vec<bool>,
+    track_metadata: Vec<Option<AudioMetadata>>,
+    track_metadata_queued: Vec<bool>,
+    track_column_order: Vec<TrackColumn>,
+    track_column_visible: [bool; TRACK_COLUMN_COUNT],
     selected_track: Option<usize>,
+    resume_position_seconds: f32,
+    last_saved_position_seconds: f32,
     audio_metadata: Option<AudioMetadata>,
-    metadata_loading: Option<mpsc::Receiver<AudioMetadata>>,
+    metadata_loading: Option<mpsc::Receiver<(usize, AudioMetadata)>>,
+    metadata_sender: Option<mpsc::Sender<(usize, AudioMetadata)>>,
+    metadata_pending: usize,
     audio_output: Option<rodio::MixerDeviceSink>,
     audio_player: Option<rodio::Player>,
+    chain_transition: Option<ChainMode>,
+    chain_transition_started: Option<Instant>,
     audio_error: Option<String>,
     stereo_faders: [f32; 2],
+    stereo_link_drag_start: Option<[f32; 2]>,
+    stereo_link_pointer_start: Option<f32>,
     channel_gains: Arc<Mutex<[f32; 2]>>,
     analysis_buffer: Option<Arc<Mutex<LiveAnalysisBuffer>>>,
     channel_levels: [f32; 2],
     stereo_spectrum: [[f32; SPECTRUM_BANDS]; 2],
+    room_spectrum: [f32; ROOM_SPECTRUM_BANDS],
+    microphone_buffer: Option<Arc<Mutex<LiveAnalysisBuffer>>>,
+    microphone_stop: Option<Arc<AtomicBool>>,
+    microphone_thread: Option<JoinHandle<()>>,
+    microphone_devices: Vec<rodio::microphone::Input>,
+    microphone_device_index: usize,
+    microphone_error: Option<String>,
+    microphone_pitch: Option<PitchEstimate>,
+    microphone_chord: Option<ChordEstimate>,
+    live_tab_strumming: bool,
+    metronome_enabled: bool,
+    metronome_bpm: f32,
+    tablature_playing: bool,
+    tablature_recording: bool,
+    tablature_pause_started: Option<Instant>,
+    tablature_notes: VecDeque<TablatureNote>,
+    tablature_last_position: Option<(usize, u8)>,
+    tablature_last_recorded_at: Option<Instant>,
     toolbar_textures: ToolbarTextures,
 }
 
@@ -431,6 +653,16 @@ impl PlayDesktop {
                 "play_toolbar_button_pressed",
                 include_bytes!("../../../assets/texture/bouton_enfoncer.png"),
             ),
+            menu_normal: load_toolbar_texture(
+                &egui_context,
+                "play_toolbar_menu_normal",
+                include_bytes!("../../../assets/texture/menu_normal.png"),
+            ),
+            menu_pressed: load_toolbar_texture(
+                &egui_context,
+                "play_toolbar_menu_pressed",
+                include_bytes!("../../../assets/texture/menu_enfoncer.png"),
+            ),
         };
 
         let mut app = Self {
@@ -440,22 +672,54 @@ impl PlayDesktop {
             painter: None,
             workspace: Workspace::default(),
             scene: Scene::default(),
-            transport_options: [false; 2],
+            repeat_mode: None,
+            chain_mode: None,
+            chain_transition_seconds: 2.0,
             show_music_loader: false,
             loaded_music: Vec::new(),
             track_covers: Vec::new(),
             track_cover_checked: Vec::new(),
+            track_metadata: Vec::new(),
+            track_metadata_queued: Vec::new(),
+            track_column_order: TrackColumn::default_order(),
+            track_column_visible: TrackColumn::default_visibility(),
             selected_track: None,
+            resume_position_seconds: 0.0,
+            last_saved_position_seconds: 0.0,
             audio_metadata: None,
             metadata_loading: None,
+            metadata_sender: None,
+            metadata_pending: 0,
             audio_output: None,
             audio_player: None,
+            chain_transition: None,
+            chain_transition_started: None,
             audio_error: None,
             stereo_faders: [0.8; 2],
+            stereo_link_drag_start: None,
+            stereo_link_pointer_start: None,
             channel_gains: Arc::new(Mutex::new([0.251_188_64; 2])),
             analysis_buffer: None,
             channel_levels: [0.0; 2],
             stereo_spectrum: [[0.0; SPECTRUM_BANDS]; 2],
+            room_spectrum: [0.0; ROOM_SPECTRUM_BANDS],
+            microphone_buffer: None,
+            microphone_stop: None,
+            microphone_thread: None,
+            microphone_devices: Vec::new(),
+            microphone_device_index: 0,
+            microphone_error: None,
+            microphone_pitch: None,
+            microphone_chord: None,
+            live_tab_strumming: false,
+            metronome_enabled: false,
+            metronome_bpm: 90.0,
+            tablature_playing: true,
+            tablature_recording: true,
+            tablature_pause_started: None,
+            tablature_notes: VecDeque::new(),
+            tablature_last_position: None,
+            tablature_last_recorded_at: None,
             toolbar_textures,
         };
         app.restore_playlist();
@@ -473,7 +737,7 @@ impl PlayDesktop {
                     Window::default_attributes()
                         .with_title("Play")
                         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 760.0))
-                        .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 560.0)),
+                        .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 680.0)),
                 )
                 .expect("création de la fenêtre Play"),
         );
@@ -512,7 +776,7 @@ impl PlayDesktop {
         painter.rect_filled(rect, 8.0, Color32::from_rgb(21, 25, 35));
 
         let content = rect.shrink2(vec2(8.0, 6.0));
-        let frequency_height = 20.0;
+        let frequency_height = 28.0;
         let graph = egui::Rect::from_min_max(
             egui::pos2(content.left() + 22.0, content.top()),
             egui::pos2(content.right(), content.bottom() - frequency_height),
@@ -543,8 +807,10 @@ impl PlayDesktop {
         let maximum_height = (graph.height() * 0.5 - 1.0).max(1.0);
         for band in 0..SPECTRUM_BANDS {
             let x = graph.left() + band as f32 * band_width;
-            let left_height = self.stereo_spectrum[0][band].clamp(0.0, 1.0) * maximum_height;
-            let right_height = self.stereo_spectrum[1][band].clamp(0.0, 1.0) * maximum_height;
+            let left_height =
+                Self::spectrum_display_level(self.stereo_spectrum[0][band]) * maximum_height;
+            let right_height =
+                Self::spectrum_display_level(self.stereo_spectrum[1][band]) * maximum_height;
             if left_height > 0.0 {
                 painter.rect_filled(
                     egui::Rect::from_min_max(
@@ -575,16 +841,116 @@ impl PlayDesktop {
             let normalized = percent as f32 / 100.0;
             let x = egui::lerp(frequency_rect.left()..=frequency_rect.right(), normalized);
             painter.line_segment(
-                [egui::pos2(x, frequency_rect.top()), egui::pos2(x, frequency_rect.top() + 4.0)],
+                [egui::pos2(x, frequency_rect.top()), egui::pos2(x, frequency_rect.top() + 5.0)],
                 egui::Stroke::new(1.0, Color32::from_gray(115)),
             );
+            let (anchor, label_x) = if percent == 0 {
+                (egui::Align2::LEFT_CENTER, x + 1.0)
+            } else if percent == 100 {
+                (egui::Align2::RIGHT_CENTER, x - 1.0)
+            } else {
+                (egui::Align2::CENTER_CENTER, x)
+            };
             painter.text(
-                egui::pos2(x, frequency_rect.bottom()),
-                egui::Align2::CENTER_BOTTOM,
+                egui::pos2(label_x, frequency_rect.center().y + 3.0),
+                anchor,
                 label,
-                FontId::proportional(9.0),
-                Color32::from_gray(160),
+                FontId::proportional(10.0),
+                Color32::from_gray(220),
             );
+        }
+    }
+
+    fn draw_room_spectrum(&self, ui: &mut egui::Ui) {
+        let desired_size = vec2(ui.available_width(), ui.available_height().max(320.0));
+        let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::hover());
+        let rect = response.rect;
+        painter.rect_filled(rect, 8.0, Color32::from_rgb(21, 25, 35));
+
+        let content = rect.shrink2(vec2(8.0, 8.0));
+        let frequency_height = 28.0;
+        let graph = egui::Rect::from_min_max(
+            egui::pos2(content.left() + 42.0, content.top()),
+            egui::pos2(content.right(), content.bottom() - frequency_height),
+        );
+        painter.rect_filled(graph, 0.0, Color32::from_rgb(24, 38, 49));
+
+        for step in 0..=5 {
+            let level = step as f32 * 22.0;
+            let y = graph.bottom() - graph.height() * step as f32 / 5.0;
+            painter.line_segment(
+                [egui::pos2(graph.left(), y), egui::pos2(graph.right(), y)],
+                egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(110, 130, 145, 75)),
+            );
+            painter.text(
+                egui::pos2(content.left(), y),
+                egui::Align2::LEFT_CENTER,
+                format!("{level:.0} dB"),
+                FontId::proportional(10.0),
+                Color32::from_gray(205),
+            );
+        }
+
+        let band_width = graph.width() / ROOM_SPECTRUM_BANDS as f32;
+        let bar_width = (band_width - 0.5).max(1.0);
+        for (band, amplitude) in self.room_spectrum.iter().enumerate() {
+            let x = graph.left() + band as f32 * band_width;
+            let height = Self::room_spectrum_display_level(*amplitude) * graph.height();
+            if height > 0.0 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, graph.bottom() - height),
+                        egui::pos2(x + bar_width, graph.bottom()),
+                    ),
+                    0.0,
+                    Color32::from_rgb(74, 205, 174),
+                );
+            }
+        }
+
+        let frequency_rect = egui::Rect::from_min_max(
+            egui::pos2(graph.left(), content.bottom() - frequency_height),
+            content.right_bottom(),
+        );
+        for (percent, label) in SPECTRUM_FREQUENCY_LABELS {
+            let normalized = percent as f32 / 100.0;
+            let x = egui::lerp(frequency_rect.left()..=frequency_rect.right(), normalized);
+            painter.line_segment(
+                [egui::pos2(x, frequency_rect.top()), egui::pos2(x, frequency_rect.top() + 5.0)],
+                egui::Stroke::new(1.0, Color32::from_gray(115)),
+            );
+            let (anchor, label_x) = if percent == 0 {
+                (egui::Align2::LEFT_CENTER, x + 1.0)
+            } else if percent == 100 {
+                (egui::Align2::RIGHT_CENTER, x - 1.0)
+            } else {
+                (egui::Align2::CENTER_CENTER, x)
+            };
+            painter.text(
+                egui::pos2(label_x, frequency_rect.center().y + 3.0),
+                anchor,
+                label,
+                FontId::proportional(10.0),
+                Color32::from_gray(220),
+            );
+        }
+    }
+
+    fn spectrum_display_level(amplitude: f32) -> f32 {
+        const FLOOR_DB: f32 = -60.0;
+        if amplitude <= 0.000001 {
+            0.0
+        } else {
+            ((20.0 * amplitude.clamp(0.0, 1.0).log10() - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
+        }
+    }
+
+    fn room_spectrum_display_level(amplitude: f32) -> f32 {
+        const ROOM_DB_MAX: f32 = 110.0;
+        if amplitude <= 0.000001 {
+            0.0
+        } else {
+            ((20.0 * amplitude.clamp(0.0, 1.0).log10() + ROOM_DB_MAX) / ROOM_DB_MAX).clamp(0.0, 1.0)
         }
     }
 
@@ -632,15 +998,24 @@ impl PlayDesktop {
             {
                 self.change_track(-1);
             }
-            let play_icon = if self.workspace.transport == TransportState::Playing {
+            let live_tablature = self.scene.mode == WorkspaceMode::LiveTablature;
+            let play_icon = if (live_tablature && self.tablature_playing)
+                || (!live_tablature && self.workspace.transport == TransportState::Playing)
+            {
                 "\u{e034}"
             } else {
                 "\u{e037}"
             };
-            if toolbar_icon_button(ui, &self.toolbar_textures, play_icon, false, "Lecture / pause")
+            let play_tooltip =
+                if live_tablature { "Lecture / pause tablature" } else { "Lecture / pause" };
+            if toolbar_icon_button(ui, &self.toolbar_textures, play_icon, false, play_tooltip)
                 .clicked()
             {
-                self.toggle_playback();
+                if live_tablature {
+                    self.toggle_tablature_playback();
+                } else {
+                    self.toggle_playback();
+                }
             }
             if toolbar_icon_button(ui, &self.toolbar_textures, "\u{e047}", false, "Arrêter")
                 .clicked()
@@ -652,16 +1027,48 @@ impl PlayDesktop {
             {
                 self.change_track(1);
             }
-            for (selected, (icon, label)) in self
-                .transport_options
-                .iter_mut()
-                .zip([("\u{e040}", "Répéter"), ("\u{e05f}", "Enchaîner")])
-            {
-                if toolbar_icon_button(ui, &self.toolbar_textures, icon, *selected, label).clicked()
-                {
-                    *selected = !*selected;
+            let repeat_response =
+                toolbar_menu_button(ui, &self.toolbar_textures, "\u{e040}", "Répéter");
+            egui::Popup::menu(&repeat_response).show(|ui| {
+                ui.set_min_width(190.0);
+                let mut repeat_track = self.repeat_mode == Some(RepeatMode::Track);
+                if ui.checkbox(&mut repeat_track, "Répéter seul").changed() {
+                    self.repeat_mode = repeat_track.then_some(RepeatMode::Track);
+                    ui.close();
                 }
-            }
+                let mut repeat_all = self.repeat_mode == Some(RepeatMode::All);
+                if ui.checkbox(&mut repeat_all, "Répéter tout").changed() {
+                    self.repeat_mode = repeat_all.then_some(RepeatMode::All);
+                    ui.close();
+                }
+            });
+
+            let chain_response =
+                toolbar_menu_button(ui, &self.toolbar_textures, "\u{e05f}", "Enchaîner");
+            egui::Popup::menu(&chain_response).show(|ui| {
+                ui.set_min_width(250.0);
+                let mut chain_normal = self.chain_mode == Some(ChainMode::Normal);
+                if ui.checkbox(&mut chain_normal, "Enchaîner").changed() {
+                    self.chain_mode = chain_normal.then_some(ChainMode::Normal);
+                    ui.close();
+                }
+                let mut chain_volume = self.chain_mode == Some(ChainMode::VolumeFader);
+                if ui.checkbox(&mut chain_volume, "Enchaîner avec fader volume").changed() {
+                    self.chain_mode = chain_volume.then_some(ChainMode::VolumeFader);
+                    ui.close();
+                }
+                let mut chain_tempo = self.chain_mode == Some(ChainMode::TempoFader);
+                if ui.checkbox(&mut chain_tempo, "Enchaîner avec fader tempo").changed() {
+                    self.chain_mode = chain_tempo.then_some(ChainMode::TempoFader);
+                    ui.close();
+                }
+                ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut self.chain_transition_seconds, 0.0..=10.0)
+                        .text("Durée")
+                        .suffix(" s"),
+                );
+            });
 
             toolbar_separator(ui);
             if toolbar_icon_button(
@@ -681,6 +1088,120 @@ impl PlayDesktop {
     fn select_mode(&mut self, mode: WorkspaceMode) {
         self.scene.mode = mode;
         self.workspace.document.mode = mode;
+        if mode == WorkspaceMode::LiveTablature {
+            self.tablature_playing = true;
+            self.tablature_recording = true;
+            self.tablature_pause_started = None;
+        }
+        if matches!(mode, WorkspaceMode::RoomAnalyzer | WorkspaceMode::LiveTablature) {
+            self.start_microphone();
+        } else {
+            self.stop_microphone();
+        }
+    }
+
+    fn start_microphone(&mut self) {
+        if self.microphone_buffer.is_some() {
+            return;
+        }
+        self.microphone_error = None;
+        if self.microphone_devices.is_empty() {
+            self.refresh_microphone_devices();
+        }
+        let Some(device) = self.microphone_devices.get(self.microphone_device_index).cloned()
+        else {
+            self.microphone_error =
+                Some("Aucune entrée audio USB ou microphone disponible".to_owned());
+            return;
+        };
+        let builder = match rodio::microphone::MicrophoneBuilder::new().device(device) {
+            Ok(builder) => builder,
+            Err(error) => {
+                self.microphone_error = Some(format!("Micro : {error}"));
+                return;
+            }
+        };
+        let builder = match builder.default_config() {
+            Ok(builder) => builder,
+            Err(error) => {
+                self.microphone_error = Some(format!("Configuration micro : {error}"));
+                return;
+            }
+        };
+        let config = builder.get_config();
+        let microphone = match builder.open_stream() {
+            Ok(microphone) => microphone,
+            Err(error) => {
+                self.microphone_error = Some(format!("Ouverture du micro : {error}"));
+                return;
+            }
+        };
+        let channels = config.channel_count.get() as usize;
+        let sample_rate = config.sample_rate.get() as f32;
+        let buffer = Arc::new(Mutex::new(LiveAnalysisBuffer::new(channels, sample_rate)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_buffer = buffer.clone();
+        let thread_stop = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut microphone = microphone;
+            let mut pending = Vec::with_capacity(channels * 512);
+            while !thread_stop.load(Ordering::Relaxed) {
+                let Some(sample) = microphone.next() else { break };
+                pending.push(sample);
+                if pending.len() >= channels * 512 {
+                    if let Ok(mut analysis) = thread_buffer.lock() {
+                        analysis.push_samples(&pending);
+                    }
+                    pending.clear();
+                }
+            }
+            if !pending.is_empty() {
+                if let Ok(mut analysis) = thread_buffer.lock() {
+                    analysis.push_samples(&pending);
+                }
+            }
+        });
+        self.microphone_buffer = Some(buffer);
+        self.microphone_stop = Some(stop);
+        self.microphone_thread = Some(thread);
+    }
+
+    fn stop_microphone(&mut self) {
+        if let Some(stop) = self.microphone_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(thread) = self.microphone_thread.take() {
+            let _ = thread.join();
+        }
+        self.microphone_buffer = None;
+        self.microphone_pitch = None;
+        self.microphone_chord = None;
+        self.tablature_playing = true;
+        self.tablature_recording = true;
+        self.tablature_pause_started = None;
+        self.tablature_notes.clear();
+        self.tablature_last_position = None;
+        self.tablature_last_recorded_at = None;
+        if self.scene.mode != WorkspaceMode::Player {
+            self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
+            self.room_spectrum = [0.0; ROOM_SPECTRUM_BANDS];
+            self.channel_levels = [0.0; 2];
+        }
+    }
+
+    fn refresh_microphone_devices(&mut self) {
+        match rodio::microphone::available_inputs() {
+            Ok(devices) => {
+                self.microphone_devices = devices;
+                if self.microphone_device_index >= self.microphone_devices.len() {
+                    self.microphone_device_index = 0;
+                }
+            }
+            Err(error) => {
+                self.microphone_devices.clear();
+                self.microphone_error = Some(format!("Liste des entrées audio : {error}"));
+            }
+        }
     }
 
     fn change_track(&mut self, offset: isize) {
@@ -701,9 +1222,39 @@ impl PlayDesktop {
         let Some(path) = playlist_storage_path() else { return };
         let Ok(contents) = std::fs::read_to_string(path) else { return };
         let Ok(saved) = ron::from_str::<SavedPlaylist>(&contents) else { return };
+        let saved_selected_track = saved.selected_track;
+        let saved_position_seconds = saved.position_seconds.max(0.0);
+        if !saved.column_order.is_empty() {
+            self.track_column_order = Self::normalize_column_order(saved.column_order);
+        }
+        if saved.layout_version > 0 && !saved.visible_columns.is_empty() {
+            self.track_column_visible = [false; TRACK_COLUMN_COUNT];
+            for column in saved.visible_columns {
+                self.track_column_visible[column.index()] = true;
+            }
+            if !self.track_column_visible.iter().any(|visible| *visible) {
+                self.track_column_visible = TrackColumn::default_visibility();
+            }
+        }
         for path in saved.paths {
             self.add_music_path(PathBuf::from(path));
         }
+        self.selected_track = saved_selected_track
+            .filter(|index| *index < self.loaded_music.len())
+            .or(self.selected_track);
+        self.resume_position_seconds =
+            if self.selected_track.is_some() { saved_position_seconds } else { 0.0 };
+        self.last_saved_position_seconds = self.resume_position_seconds;
+    }
+
+    fn normalize_column_order(order: Vec<TrackColumn>) -> Vec<TrackColumn> {
+        let mut normalized = Vec::with_capacity(TrackColumn::default_order().len());
+        for column in order.into_iter().chain(TrackColumn::default_order()) {
+            if !normalized.contains(&column) {
+                normalized.push(column);
+            }
+        }
+        normalized
     }
 
     fn save_playlist(&self) {
@@ -718,9 +1269,71 @@ impl PlayDesktop {
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
+            column_order: self.track_column_order.clone(),
+            visible_columns: self
+                .track_column_order
+                .iter()
+                .copied()
+                .filter(|column| self.track_column_visible[column.index()])
+                .collect(),
+            layout_version: 1,
+            selected_track: self.selected_track,
+            position_seconds: self
+                .audio_player
+                .as_ref()
+                .map(|player| player.get_pos().as_secs_f32())
+                .unwrap_or(self.resume_position_seconds)
+                .max(0.0),
         };
         let Ok(contents) = ron::to_string(&saved) else { return };
         let _ = std::fs::write(path, contents);
+    }
+
+    fn queue_metadata_load(&mut self, index: usize, path: PathBuf) {
+        if let Some(queued) = self.track_metadata_queued.get_mut(index) {
+            if *queued {
+                return;
+            }
+            *queued = true;
+        }
+        if self.metadata_sender.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            self.metadata_sender = Some(sender);
+            self.metadata_loading = Some(receiver);
+        }
+        let Some(sender) = self.metadata_sender.as_ref().cloned() else {
+            return;
+        };
+        self.metadata_pending += 1;
+        std::thread::spawn(move || {
+            let metadata = load_track_metadata(&path);
+            let _ = sender.send((index, metadata));
+        });
+    }
+
+    fn apply_track_metadata(&mut self, index: usize, metadata: AudioMetadata) {
+        if let Some(slot) = self.track_metadata.get_mut(index) {
+            *slot = Some(metadata.clone());
+        }
+        if let Some(queued) = self.track_metadata_queued.get_mut(index) {
+            *queued = false;
+        }
+        if let Some(track) = self.workspace.document.tracks.get_mut(index) {
+            track.duration_seconds = metadata.duration_seconds;
+            if let Some(title) = &metadata.title {
+                track.title = title.clone();
+            }
+            if let Some(artist) = &metadata.artist {
+                track.artist = artist.clone();
+            }
+            if let Some(album) = &metadata.album {
+                track.album = album.clone();
+            }
+            track.year = metadata.year;
+        }
+        if self.selected_track == Some(index) {
+            self.audio_metadata = Some(metadata);
+        }
     }
 
     fn add_music_path(&mut self, path: PathBuf) {
@@ -736,81 +1349,306 @@ impl PlayDesktop {
         self.workspace.document.tracks.push(Track {
             title,
             artist: "Fichier local".to_owned(),
+            album: String::new(),
+            year: None,
             duration_seconds: 0.0,
         });
         self.track_covers.push(None);
         self.track_cover_checked.push(false);
-        self.loaded_music.push(path);
+        self.track_metadata.push(None);
+        self.track_metadata_queued.push(false);
+        let index = self.loaded_music.len();
+        self.loaded_music.push(path.clone());
+        if self.selected_track.is_none() {
+            self.selected_track = Some(index);
+        }
+        self.queue_metadata_load(index, path);
+    }
+
+    fn draw_track_column_menu_contents(&mut self, ui: &mut Ui) {
+        let mut changed = false;
+        ui.label(RichText::new("Afficher et réordonner").small().color(Color32::GRAY));
+        ui.separator();
+        let visible_count = self.track_column_visible.iter().filter(|visible| **visible).count();
+        let order = self.track_column_order.clone();
+        for (position, column) in order.into_iter().enumerate() {
+            ui.horizontal(|ui| {
+                let checked = self.track_column_visible[column.index()];
+                let can_toggle = !checked || visible_count > 1;
+                let mut next_checked = checked;
+                if ui
+                    .add_enabled(can_toggle, egui::Checkbox::new(&mut next_checked, column.label()))
+                    .changed()
+                {
+                    self.track_column_visible[column.index()] = next_checked;
+                    changed = true;
+                }
+                if ui.add_enabled(position > 0, egui::Button::new("↑").small()).clicked() {
+                    self.track_column_order.swap(position, position - 1);
+                    changed = true;
+                }
+                if ui
+                    .add_enabled(
+                        position + 1 < self.track_column_order.len(),
+                        egui::Button::new("↓").small(),
+                    )
+                    .clicked()
+                {
+                    self.track_column_order.swap(position, position + 1);
+                    changed = true;
+                }
+            });
+        }
+        ui.separator();
+        if ui.button("Réinitialiser").clicked() {
+            self.track_column_order = TrackColumn::default_order();
+            self.track_column_visible = TrackColumn::default_visibility();
+            changed = true;
+            ui.close();
+        }
+        if changed {
+            self.save_playlist();
+        }
+    }
+
+    fn track_column_widths(
+        columns: &[TrackColumn],
+        available_width: f32,
+    ) -> Vec<(TrackColumn, f32)> {
+        let base_width: f32 = columns.iter().map(|column| column.width()).sum();
+        let mut widths: Vec<_> =
+            columns.iter().copied().map(|column| (column, column.width())).collect();
+        if base_width < available_width && !widths.is_empty() {
+            let target_index =
+                columns.iter().position(|column| *column == TrackColumn::Title).unwrap_or(0);
+            widths[target_index].1 += available_width - base_width;
+        }
+        widths
+    }
+
+    fn track_cell_text(
+        column: TrackColumn,
+        index: usize,
+        track: &Track,
+        path: Option<&Path>,
+        metadata: Option<&AudioMetadata>,
+    ) -> String {
+        match column {
+            TrackColumn::Number => format!("{:02}", index + 1),
+            TrackColumn::Title => track.title.clone(),
+            TrackColumn::Artist => track.artist.clone(),
+            TrackColumn::Album => {
+                if track.album.is_empty() {
+                    "—".to_owned()
+                } else {
+                    track.album.clone()
+                }
+            }
+            TrackColumn::Year => {
+                track.year.map(|year| year.to_string()).unwrap_or_else(|| "—".to_owned())
+            }
+            TrackColumn::Duration => {
+                if track.duration_seconds > 0.0 {
+                    Self::format_time(track.duration_seconds)
+                } else {
+                    "—".to_owned()
+                }
+            }
+            TrackColumn::Format => {
+                if let Some(metadata) = metadata {
+                    let bit_depth = metadata
+                        .bit_depth
+                        .map(|bits| format!("{bits} bits"))
+                        .unwrap_or_else(|| "— bits".to_owned());
+                    format!(
+                        "{} / {} / {}",
+                        metadata.format,
+                        bit_depth,
+                        Self::format_sample_rate(metadata.sample_rate)
+                    )
+                } else {
+                    path.and_then(|path| path.extension())
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| extension.to_uppercase())
+                        .unwrap_or_else(|| "—".to_owned())
+                }
+            }
+            TrackColumn::File => path
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("—")
+                .to_owned(),
+        }
+    }
+
+    fn draw_track_cell(
+        ui: &mut Ui,
+        column: TrackColumn,
+        width: f32,
+        height: f32,
+        text: impl Into<egui::WidgetText>,
+    ) {
+        // Réserver explicitement la largeur de la colonne avant de dessiner le
+        // texte évite que le layout d'egui ne compacte les cellules à leur taille
+        // minimale quand la liste est dans un ScrollArea.
+        let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+        let text_rect = if column.alignment() == egui::Align::Min {
+            rect.with_min_x((rect.left() + 4.0).min(rect.right()))
+        } else {
+            rect
+        };
+        ui.put(text_rect, egui::Label::new(text).halign(column.alignment()).truncate());
+    }
+
+    fn track_info_height(&self) -> f32 {
+        TRACK_INFO_HEIGHT
     }
 
     fn draw_track_list(&mut self, ui: &mut Ui) {
-        let content_height = (ui.available_height()
+        let track_info_height = self.track_info_height();
+        let visible_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(0.0);
+        let content_height = (visible_height
             - SPECTRUM_HEIGHT
-            - TRACK_INFO_HEIGHT
-            - CONTENT_GAP * 2.0
+            - track_info_height
+            - PLAYER_CONTENT_GAP * 2.0
             - TRACK_LIST_INNER_MARGIN)
-            .max(120.0);
+            .max(TRACK_HEADER_HEIGHT);
         let mut clicked_track = None;
+        let visible_columns: Vec<_> = self
+            .track_column_order
+            .iter()
+            .copied()
+            .filter(|column| self.track_column_visible[column.index()])
+            .collect();
+        let visible_columns =
+            if visible_columns.is_empty() { vec![TrackColumn::Title] } else { visible_columns };
         Frame::new()
             .fill(Color32::from_rgb(29, 34, 43))
             .corner_radius(CornerRadius::same(6))
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
-                // Réserve une hauteur fixe pour que le contenu de la liste ne
-                // puisse pas repousser l'analyseur spectral vers le bas.
-                ui.set_height(content_height);
-                if self.workspace.document.tracks.is_empty() {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space((content_height - 24.0).max(0.0) * 0.5);
-                        ui.label(
-                            RichText::new("Aucune piste chargée").color(Color32::from_gray(170)),
-                        );
-                    });
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("track_list")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for (index, track) in self.workspace.document.tracks.iter().enumerate()
-                            {
-                                let selected = self.selected_track == Some(index);
-                                let row = ui.allocate_ui_with_layout(
-                                    vec2(ui.available_width(), TRACK_ROW_HEIGHT),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        let row_rect = ui.max_rect().shrink(2.0);
-                                        if selected {
-                                            ui.painter().rect_filled(
-                                                row_rect,
+                let content_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    vec2(content_width, content_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        if self.workspace.document.tracks.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(
+                                    (content_height - TRACK_HEADER_HEIGHT - 24.0).max(0.0) * 0.5,
+                                );
+                                ui.label(
+                                    RichText::new("Aucune piste chargée")
+                                        .color(Color32::from_gray(170)),
+                                );
+                            });
+                        } else {
+                            let column_widths =
+                                Self::track_column_widths(&visible_columns, ui.available_width());
+                            let total_width =
+                                column_widths.iter().map(|(_, width)| *width).sum::<f32>();
+                            egui::ScrollArea::both()
+                                .id_salt("track_list")
+                                .auto_shrink([false, false])
+                                .max_height(content_height)
+                                .show(ui, |ui| {
+                                    // L'en-tête et les lignes partagent le même conteneur et les
+                                    // mêmes largeurs. Les colonnes conservent leur largeur
+                                    // native : ScrollArea ajoute alors le défilement horizontal
+                                    // quand la fenêtre est trop étroite.
+                                    ui.set_min_width(total_width);
+                                    let header = ui.allocate_ui_with_layout(
+                                        vec2(total_width, TRACK_HEADER_HEIGHT),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.spacing_mut().item_spacing.x = 0.0;
+                                            for (column, width) in &column_widths {
+                                                Self::draw_track_cell(
+                                                    ui,
+                                                    *column,
+                                                    *width,
+                                                    TRACK_HEADER_HEIGHT,
+                                                    RichText::new(column.label())
+                                                        .strong()
+                                                        .color(Color32::from_gray(185)),
+                                                );
+                                            }
+                                        },
+                                    );
+                                    let header_response = ui.interact(
+                                        header.response.rect,
+                                        ui.id().with("track_column_headers"),
+                                        Sense::click(),
+                                    );
+                                    egui::Popup::menu(&header_response)
+                                        .show(|ui| self.draw_track_column_menu_contents(ui));
+                                    ui.separator();
+                                    for (index, track) in
+                                        self.workspace.document.tracks.iter().enumerate()
+                                    {
+                                        let selected = self.selected_track == Some(index);
+                                        let path =
+                                            self.loaded_music.get(index).map(PathBuf::as_path);
+                                        let row = ui.allocate_ui_with_layout(
+                                            vec2(total_width, TRACK_ROW_HEIGHT),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                let row_rect = ui.max_rect().shrink(2.0);
+                                                if selected {
+                                                    ui.painter().rect_filled(
+                                                        row_rect,
+                                                        4.0,
+                                                        Color32::from_rgb(49, 91, 95),
+                                                    );
+                                                }
+                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                for (column, width) in &column_widths {
+                                                    let text = Self::track_cell_text(
+                                                        *column,
+                                                        index,
+                                                        track,
+                                                        path,
+                                                        self.track_metadata
+                                                            .get(index)
+                                                            .and_then(|metadata| metadata.as_ref()),
+                                                    );
+                                                    Self::draw_track_cell(
+                                                        ui,
+                                                        *column,
+                                                        *width,
+                                                        TRACK_ROW_HEIGHT,
+                                                        text,
+                                                    );
+                                                }
+                                            },
+                                        );
+                                        let row_response = ui.interact(
+                                            row.response.rect,
+                                            ui.id().with(("track_row", index)),
+                                            Sense::click(),
+                                        );
+                                        if row_response.clicked() {
+                                            clicked_track = Some(index);
+                                        }
+                                        if row_response.hovered() {
+                                            ui.painter().rect_stroke(
+                                                row_response.rect.shrink(1.0),
                                                 4.0,
-                                                Color32::from_rgb(49, 91, 95),
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    Color32::from_rgb(72, 184, 166),
+                                                ),
+                                                egui::StrokeKind::Inside,
                                             );
                                         }
-                                        ui.add_space(8.0);
-                                        ui.label(format!("{:02}", index + 1));
-                                        ui.vertical(|ui| {
-                                            ui.label(&track.title);
-                                            ui.small(&track.artist);
-                                        });
-                                    },
-                                );
-                                if row.response.interact(Sense::click()).clicked() {
-                                    clicked_track = Some(index);
-                                }
-                                if row.response.hovered() {
-                                    ui.painter().rect_stroke(
-                                        row.response.rect.shrink(1.0),
-                                        4.0,
-                                        egui::Stroke::new(1.0, Color32::from_rgb(72, 184, 166)),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
-                                if index + 1 < self.workspace.document.tracks.len() {
-                                    ui.separator();
-                                }
-                            }
-                        });
-                }
+                                        if index + 1 < self.workspace.document.tracks.len() {
+                                            ui.separator();
+                                        }
+                                    }
+                                });
+                        }
+                    },
+                );
             });
 
         if let Some(index) = clicked_track {
@@ -820,6 +1658,9 @@ impl PlayDesktop {
 
     fn draw_track_info(&mut self, ui: &mut Ui) {
         let available_width = ui.available_width();
+        let info_index = self
+            .selected_track
+            .or_else(|| (!self.workspace.document.tracks.is_empty()).then_some(0));
         Frame::new()
             .fill(Color32::from_rgb(29, 34, 43))
             .corner_radius(CornerRadius::same(6))
@@ -828,8 +1669,8 @@ impl PlayDesktop {
                 let content_width = (available_width - 16.0).max(0.0);
                 ui.set_min_width(content_width);
                 ui.set_width(content_width);
-                ui.set_height((TRACK_INFO_HEIGHT - 16.0).max(0.0));
-                if let Some(index) = self.selected_track {
+                ui.set_height((self.track_info_height() - 16.0).max(0.0));
+                if let Some(index) = info_index {
                     if !self.track_cover_checked.get(index).copied().unwrap_or(true) {
                         let cover = self
                             .loaded_music
@@ -846,19 +1687,27 @@ impl PlayDesktop {
                         self.workspace.document.tracks.get(index).map(|track| track.title.clone());
                     let track_artist =
                         self.workspace.document.tracks.get(index).map(|track| track.artist.clone());
+                    let track_album =
+                        self.workspace.document.tracks.get(index).map(|track| track.album.clone());
+                    let track_year =
+                        self.workspace.document.tracks.get(index).and_then(|track| track.year);
                     let cover = self.track_covers.get(index).and_then(Option::as_ref).cloned();
-                    let metadata = self.audio_metadata.clone();
+                    let metadata = self
+                        .audio_metadata
+                        .clone()
+                        .or_else(|| self.track_metadata.get(index).and_then(Clone::clone));
                     let audio_error = self.audio_error.clone();
-                    let transport = self.workspace.transport;
+                    let cover_size = (TRACK_INFO_HEIGHT - 16.0).max(0.0);
                     ui.horizontal(|ui| {
                         if let Some(cover) = cover.as_ref() {
                             ui.add(
-                                egui::Image::new((cover.id(), vec2(96.0, 96.0))).corner_radius(4.0),
+                                egui::Image::new((cover.id(), vec2(cover_size, cover_size)))
+                                    .corner_radius(4.0),
                             );
                         } else {
-                            ui.allocate_ui(vec2(96.0, 96.0), |ui| {
+                            ui.allocate_ui(vec2(cover_size, cover_size), |ui| {
                                 ui.vertical_centered(|ui| {
-                                    ui.add_space(34.0);
+                                    ui.add_space((cover_size - 34.0).max(0.0) * 0.5);
                                     ui.label("♪");
                                     ui.small("Aucune jaquette");
                                 });
@@ -879,7 +1728,14 @@ impl PlayDesktop {
                                 if let Some(artist) = &track_artist {
                                     left.label(artist);
                                 }
-                                left.label(format!("État : {:?}", transport));
+                                if let Some(album) = &track_album {
+                                    if !album.is_empty() {
+                                        left.small(format!("Album : {album}"));
+                                    }
+                                }
+                                if let Some(year) = track_year {
+                                    left.small(format!("Année : {year}"));
+                                }
                                 if let Some(metadata) = &metadata {
                                     let bit_depth = metadata
                                         .bit_depth
@@ -890,16 +1746,14 @@ impl PlayDesktop {
                                     } else {
                                         format!("{} canaux", metadata.channels)
                                     };
-                                    right.colored_label(
-                                        Color32::from_rgb(110, 220, 190),
-                                        format!(
-                                            "{} • {} • {} • {}",
-                                            metadata.format,
-                                            bit_depth,
-                                            Self::format_sample_rate(metadata.sample_rate),
-                                            channels
-                                        ),
+                                    let quality = format!(
+                                        "{} • {} • {} • {}",
+                                        metadata.format,
+                                        bit_depth,
+                                        Self::format_sample_rate(metadata.sample_rate),
+                                        channels
                                     );
+                                    right.colored_label(Color32::from_rgb(110, 220, 190), quality);
                                     right.small(format!(
                                         "Durée {} • BPM {}",
                                         Self::format_time(metadata.duration_seconds),
@@ -925,8 +1779,8 @@ impl PlayDesktop {
                     });
                 } else {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(36.0);
-                        ui.label("Sélectionnez une piste pour afficher ses informations");
+                        ui.add_space((self.track_info_height() - 16.0 - 18.0).max(0.0) * 0.5);
+                        ui.label("Aucune piste chargée");
                     });
                 }
             });
@@ -946,17 +1800,33 @@ impl PlayDesktop {
     }
 
     fn draw_playback_seek(&mut self, ui: &mut Ui) {
+        let info_index = self
+            .selected_track
+            .or_else(|| (!self.workspace.document.tracks.is_empty()).then_some(0));
         let duration = self
             .audio_metadata
             .as_ref()
             .map(|metadata| metadata.duration_seconds)
+            .or_else(|| {
+                info_index.and_then(|index| {
+                    self.track_metadata
+                        .get(index)
+                        .and_then(|metadata| metadata.as_ref())
+                        .map(|metadata| metadata.duration_seconds)
+                })
+            })
+            .or_else(|| {
+                info_index.and_then(|index| {
+                    self.workspace.document.tracks.get(index).map(|track| track.duration_seconds)
+                })
+            })
             .filter(|duration| *duration > 0.0)
             .unwrap_or(0.0);
         let current = self
             .audio_player
             .as_ref()
             .map(|player| player.get_pos().as_secs_f32())
-            .unwrap_or(0.0)
+            .unwrap_or(self.resume_position_seconds)
             .min(duration);
         let mut position = current;
 
@@ -986,6 +1856,10 @@ impl PlayDesktop {
             && let Err(error) = player.try_seek(Duration::from_secs_f32(position))
         {
             self.audio_error = Some(format!("Recherche impossible : {error}"));
+        } else if slider.changed() {
+            self.resume_position_seconds = position;
+            self.save_playlist();
+            self.last_saved_position_seconds = position;
         }
     }
 
@@ -1103,15 +1977,42 @@ impl PlayDesktop {
             );
             let response =
                 ui.interact(middle, ui.id().with("stereo_fader_link"), Sense::click_and_drag());
-            if (response.clicked() || response.is_pointer_button_down_on())
+            let link_track = egui::Rect::from_center_size(
+                middle.center(),
+                vec2(2.0, (middle.height() - 16.0).max(1.0)),
+            );
+            if response.drag_started()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                let track = egui::Rect::from_center_size(
-                    middle.center(),
-                    vec2(2.0, (middle.height() - 16.0).max(1.0)),
-                );
-                let value = ((track.bottom() - pointer.y) / track.height()).clamp(0.0, 1.0);
-                self.stereo_faders = [value, value];
+                self.stereo_link_drag_start = Some(self.stereo_faders);
+                self.stereo_link_pointer_start = Some(pointer.y);
+            }
+            if response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let target =
+                    ((link_track.bottom() - pointer.y) / link_track.height()).clamp(0.0, 1.0);
+                let center = (self.stereo_faders[0] + self.stereo_faders[1]) * 0.5;
+                let min_delta = -self.stereo_faders[0].min(self.stereo_faders[1]);
+                let max_delta = 1.0 - self.stereo_faders[0].max(self.stereo_faders[1]);
+                let delta = (target - center).clamp(min_delta, max_delta);
+                self.stereo_faders[0] = (self.stereo_faders[0] + delta).clamp(0.0, 1.0);
+                self.stereo_faders[1] = (self.stereo_faders[1] + delta).clamp(0.0, 1.0);
+            } else if response.is_pointer_button_down_on()
+                && let (Some(start), Some(pointer_start), Some(pointer)) = (
+                    self.stereo_link_drag_start,
+                    self.stereo_link_pointer_start,
+                    response.interact_pointer_pos(),
+                )
+            {
+                let delta = ((pointer_start - pointer.y) / link_track.height())
+                    .clamp(-start[0].min(start[1]), 1.0 - start[0].max(start[1]));
+                self.stereo_faders =
+                    [(start[0] + delta).clamp(0.0, 1.0), (start[1] + delta).clamp(0.0, 1.0)];
+            }
+            if response.drag_stopped() || response.clicked() {
+                self.stereo_link_drag_start = None;
+                self.stereo_link_pointer_start = None;
             }
         });
         if let Ok(mut gains) = self.channel_gains.lock() {
@@ -1156,9 +2057,11 @@ impl PlayDesktop {
         if let Some(player) = self.audio_player.take() {
             player.stop();
         }
+        self.chain_transition = None;
+        self.chain_transition_started = None;
+        self.resume_position_seconds = 0.0;
         self.analysis_buffer = None;
         self.audio_metadata = None;
-        self.metadata_loading = None;
         self.channel_levels = [0.0; 2];
         self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
         self.workspace.stop();
@@ -1166,17 +2069,33 @@ impl PlayDesktop {
     }
 
     fn play_track(&mut self, index: usize) {
+        self.play_track_with_transition(index, None);
+    }
+
+    fn play_track_with_transition(&mut self, index: usize, transition: Option<ChainMode>) {
         let Some(path) = self.loaded_music.get(index).cloned() else {
             return;
         };
+        let transition = transition
+            .filter(|mode| *mode != ChainMode::Normal && self.chain_transition_seconds > 0.0);
 
+        let resume_position =
+            if self.selected_track == Some(index) { self.resume_position_seconds } else { 0.0 };
         self.selected_track = Some(index);
+        self.resume_position_seconds = resume_position;
+        self.last_saved_position_seconds = resume_position;
+        if self.track_metadata.get(index).is_some_and(Option::is_none)
+            && !self.track_metadata_queued.get(index).copied().unwrap_or(false)
+        {
+            self.queue_metadata_load(index, path.clone());
+        }
         if let Some(player) = self.audio_player.take() {
             player.stop();
         }
+        self.chain_transition = None;
+        self.chain_transition_started = None;
         self.analysis_buffer = None;
         self.audio_metadata = None;
-        self.metadata_loading = None;
         self.channel_levels = [0.0; 2];
         self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
         self.workspace.stop();
@@ -1197,12 +2116,15 @@ impl PlayDesktop {
             let sample_rate = decoder.sample_rate();
             let duration_seconds =
                 decoder.total_duration().map(|duration| duration.as_secs_f32()).unwrap_or(0.0);
-            let metadata = basic_audio_metadata(
-                &path,
-                sample_rate.get(),
-                channels.get() as usize,
-                duration_seconds,
-            );
+            let metadata =
+                self.track_metadata.get(index).and_then(Option::clone).unwrap_or_else(|| {
+                    basic_audio_metadata(
+                        &path,
+                        sample_rate.get(),
+                        channels.get() as usize,
+                        duration_seconds,
+                    )
+                });
             let analysis_buffer = Arc::new(Mutex::new(LiveAnalysisBuffer::new(
                 channels.get() as usize,
                 sample_rate.get() as f32,
@@ -1216,10 +2138,23 @@ impl PlayDesktop {
                 let output = self.audio_output.as_ref().expect("sortie audio initialisée");
                 rodio::Player::connect_new(output.mixer())
             };
+            match transition {
+                Some(ChainMode::VolumeFader) => player.set_volume(0.0),
+                Some(ChainMode::TempoFader) => player.set_speed(0.85),
+                _ => {}
+            }
             player.append(source);
             self.audio_player = Some(player);
             self.analysis_buffer = Some(analysis_buffer);
             self.audio_metadata = Some(metadata);
+            if resume_position > 0.0 {
+                let position = resume_position.min(duration_seconds.max(0.0));
+                if position > 0.0
+                    && let Some(player) = self.audio_player.as_ref()
+                {
+                    let _ = player.try_seek(Duration::from_secs_f32(position));
+                }
+            }
             if let Some(track) = self.workspace.document.tracks.get_mut(index) {
                 track.duration_seconds = duration_seconds;
             }
@@ -1228,31 +2163,82 @@ impl PlayDesktop {
 
         match result {
             Ok(()) => {
-                let Some(metadata) = self.audio_metadata.as_ref() else {
-                    self.workspace.transport = TransportState::Playing;
-                    return;
-                };
-                let metadata_path = path.clone();
-                let sample_rate = metadata.sample_rate;
-                let channels = metadata.channels;
-                let duration_seconds = metadata.duration_seconds;
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || {
-                    let metadata = read_audio_metadata(
-                        &metadata_path,
-                        sample_rate,
-                        channels,
-                        duration_seconds,
-                    );
-                    let _ = sender.send(metadata);
-                });
-                self.metadata_loading = Some(receiver);
                 self.workspace.transport = TransportState::Playing;
+                self.chain_transition = transition;
+                self.chain_transition_started = transition.map(|_| Instant::now());
             }
             Err(error) => {
                 self.audio_error = Some(error);
+                self.chain_transition = None;
+                self.chain_transition_started = None;
                 self.workspace.stop();
             }
+        }
+        self.save_playlist();
+        self.last_saved_position_seconds = self.resume_position_seconds;
+    }
+
+    fn finish_track(&mut self) {
+        let Some(current) = self.selected_track else {
+            self.stop_playback();
+            return;
+        };
+        let track_count = self.loaded_music.len();
+        if current >= track_count || track_count == 0 {
+            self.stop_playback();
+            return;
+        }
+
+        let (next, transition) = match (self.chain_mode, self.repeat_mode) {
+            // Sans Enchaîner, seule la répétition de la piste courante reste active.
+            (None, Some(RepeatMode::Track)) => (Some(current), None),
+            (None, Some(RepeatMode::All) | None) => (None, None),
+            // Répéter tout parcourt la liste uniquement si Enchaîner est activé.
+            (Some(_), Some(RepeatMode::Track)) => (Some(current), None),
+            (Some(chain_mode), Some(RepeatMode::All)) => {
+                (Some((current + 1) % track_count), Some(chain_mode))
+            }
+            (Some(chain_mode), None) => {
+                let next = (current + 1 < track_count).then_some(current + 1);
+                (next, Some(chain_mode))
+            }
+        };
+
+        if let Some(next) = next {
+            if next == current {
+                self.resume_position_seconds = 0.0;
+                self.last_saved_position_seconds = 0.0;
+            }
+            self.play_track_with_transition(next, transition);
+        } else {
+            self.audio_player = None;
+            self.analysis_buffer = None;
+            self.chain_transition = None;
+            self.chain_transition_started = None;
+            self.workspace.stop();
+        }
+    }
+
+    fn update_chain_transition(&mut self) {
+        let Some(mode) = self.chain_transition else {
+            return;
+        };
+        let Some(started) = self.chain_transition_started else {
+            self.chain_transition = None;
+            return;
+        };
+        let duration = self.chain_transition_seconds.max(0.01);
+        let progress = (started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
+        if let Some(player) = self.audio_player.as_ref() {
+            match mode {
+                ChainMode::VolumeFader => player.set_volume(progress),
+                ChainMode::TempoFader => player.set_speed(0.85 + progress * 0.15),
+                ChainMode::Normal => {}
+            }
+        }
+        if progress >= 1.0 {
+            self.chain_transition = None;
+            self.chain_transition_started = None;
         }
     }
 
@@ -1260,19 +2246,25 @@ impl PlayDesktop {
         let Some(receiver) = self.metadata_loading.take() else {
             return;
         };
-        match receiver.try_recv() {
-            Ok(metadata) => {
-                if let Some(index) = self.selected_track {
-                    if let Some(track) = self.workspace.document.tracks.get_mut(index) {
-                        track.duration_seconds = metadata.duration_seconds;
-                    }
+        let mut disconnected = false;
+        loop {
+            match receiver.try_recv() {
+                Ok((index, metadata)) => {
+                    self.apply_track_metadata(index, metadata);
+                    self.metadata_pending = self.metadata_pending.saturating_sub(1);
                 }
-                self.audio_metadata = Some(metadata);
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
-            Err(mpsc::TryRecvError::Empty) => {
-                self.metadata_loading = Some(receiver);
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {}
+        }
+        if disconnected || self.metadata_pending == 0 {
+            self.metadata_sender = None;
+            self.metadata_loading = None;
+        } else {
+            self.metadata_loading = Some(receiver);
         }
     }
 
@@ -1292,42 +2284,53 @@ impl PlayDesktop {
         self.save_playlist();
     }
 
-    fn update_spectrum_from_playback(&mut self) {
-        let (analyzed_bands, channel_levels) = self
-            .analysis_buffer
-            .as_ref()
-            .and_then(|analysis| {
-                let analysis = analysis.lock().ok()?;
-                let channels = analysis.channels.max(1);
-                let sample_rate = analysis.sample_rate;
-                let total_frames = analysis.samples.len() / channels;
-                if total_frames == 0 {
-                    return None;
-                }
-                let frame_count = total_frames.min(SPECTRUM_WINDOW_FRAMES);
-                let start_frame = total_frames - frame_count;
-                let mut channel_samples =
-                    [vec![0.0; SPECTRUM_WINDOW_FRAMES], vec![0.0; SPECTRUM_WINDOW_FRAMES]];
-                let mut levels = [0.0_f32; 2];
-                for offset in 0..frame_count {
-                    let frame = start_frame + offset;
-                    let first_sample = frame * channels;
-                    let left = analysis.samples[first_sample];
-                    let right =
-                        if channels > 1 { analysis.samples[first_sample + 1] } else { left };
-                    channel_samples[0][offset] = left;
-                    channel_samples[1][offset] = right;
-                    levels[0] = levels[0].max(left.abs());
-                    levels[1] = levels[1].max(right.abs());
-                }
-                let analyzer = SpectrumAnalyzer::new(sample_rate);
-                let left_bands = analyzer.analyze(&channel_samples[0]).ok()?;
-                let right_bands = analyzer.analyze(&channel_samples[1]).ok()?;
-                Some((Some([left_bands, right_bands]), levels))
-            })
-            .unwrap_or((None, [0.0; 2]));
+    fn analyze_buffer(
+        buffer: Option<&Arc<Mutex<LiveAnalysisBuffer>>>,
+    ) -> Option<([[f32; SPECTRUM_BANDS]; 2], [f32; 2], f32, Vec<f32>)> {
+        let analysis = buffer?.lock().ok()?;
+        let channels = analysis.channels.max(1);
+        let sample_rate = analysis.sample_rate;
+        let total_frames = analysis.samples.len() / channels;
+        if total_frames == 0 || sample_rate <= 0.0 {
+            return None;
+        }
+        let frame_count = total_frames.min(SPECTRUM_WINDOW_FRAMES);
+        let start_frame = total_frames - frame_count;
+        let pitch_count = total_frames.min(PITCH_WINDOW_FRAMES);
+        let pitch_start = total_frames - pitch_count;
+        let mut channel_samples =
+            [vec![0.0; SPECTRUM_WINDOW_FRAMES], vec![0.0; SPECTRUM_WINDOW_FRAMES]];
+        let mut mono_samples = Vec::with_capacity(pitch_count);
+        let mut levels = [0.0_f32; 2];
+        for offset in 0..frame_count {
+            let frame = start_frame + offset;
+            let first_sample = frame * channels;
+            let left = analysis.samples[first_sample];
+            let right = if channels > 1 { analysis.samples[first_sample + 1] } else { left };
+            channel_samples[0][offset] = left;
+            channel_samples[1][offset] = right;
+            levels[0] = levels[0].max(left.abs());
+            levels[1] = levels[1].max(right.abs());
+        }
+        for offset in 0..pitch_count {
+            let frame = pitch_start + offset;
+            let first_sample = frame * channels;
+            let left = analysis.samples[first_sample];
+            let right = if channels > 1 { analysis.samples[first_sample + 1] } else { left };
+            mono_samples.push((left + right) * 0.5);
+        }
+        let analyzer = SpectrumAnalyzer::new(sample_rate);
+        let left_bands = analyzer.analyze(&channel_samples[0]).ok()?;
+        let right_bands = analyzer.analyze(&channel_samples[1]).ok()?;
+        Some(([left_bands, right_bands], levels, sample_rate, mono_samples))
+    }
 
-        if let Some(stereo_bands) = analyzed_bands {
+    fn update_spectrum_from_buffer(
+        &mut self,
+        buffer: Option<&Arc<Mutex<LiveAnalysisBuffer>>>,
+    ) -> Option<(f32, Vec<f32>)> {
+        let analyzed = Self::analyze_buffer(buffer);
+        if let Some((stereo_bands, channel_levels, sample_rate, mono_samples)) = analyzed {
             self.stereo_spectrum = stereo_bands;
             let mut bands = [0.0; 32];
             for (index, band) in bands.iter_mut().enumerate() {
@@ -1341,11 +2344,134 @@ impl PlayDesktop {
             self.workspace.spectrum.bands = bands;
             self.workspace.spectrum.peak = bands.iter().copied().fold(0.0, f32::max);
             self.channel_levels = channel_levels;
+            Some((sample_rate, mono_samples))
         } else {
             self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
             self.workspace.spectrum = Default::default();
             self.channel_levels = [0.0; 2];
+            None
         }
+    }
+
+    fn update_spectrum_from_playback(&mut self) {
+        let buffer = self.analysis_buffer.clone();
+        let _ = self.update_spectrum_from_buffer(buffer.as_ref());
+    }
+
+    fn update_spectrum_from_microphone(&mut self) {
+        let buffer = self.microphone_buffer.clone();
+        if let Some((sample_rate, samples)) = self.update_spectrum_from_buffer(buffer.as_ref()) {
+            self.microphone_pitch = play_media::detect_pitch(&samples, sample_rate);
+            self.microphone_chord = play_media::detect_chord(&samples, sample_rate);
+            self.update_tablature_history();
+            self.update_room_spectrum_from_buffer(buffer.as_ref());
+        } else {
+            self.microphone_pitch = None;
+            self.microphone_chord = None;
+            self.tablature_last_position = None;
+            self.room_spectrum = [0.0; ROOM_SPECTRUM_BANDS];
+        }
+    }
+
+    fn update_tablature_history(&mut self) {
+        if !self.tablature_playing || !self.tablature_recording {
+            return;
+        }
+        let now = Instant::now();
+        let Some(pitch) = self.microphone_pitch else {
+            self.tablature_last_position = None;
+            return;
+        };
+        let Some((string, fret)) = Self::guitar_position(pitch.midi_note) else {
+            self.tablature_last_position = None;
+            return;
+        };
+        let position = (Self::tablature_line(string), fret);
+        let changed = self.tablature_last_position != Some(position);
+        let repeat_due = self.tablature_last_recorded_at.is_none_or(|recorded_at| {
+            recorded_at.elapsed().as_secs_f32() >= TABLATURE_NOTE_REPEAT_SECONDS
+        });
+        if changed || repeat_due {
+            self.tablature_notes.push_back(TablatureNote {
+                recorded_at: now,
+                line: position.0,
+                fret: position.1,
+            });
+            while self.tablature_notes.len() > TABLATURE_HISTORY_LIMIT {
+                self.tablature_notes.pop_front();
+            }
+            self.tablature_last_position = Some(position);
+            self.tablature_last_recorded_at = Some(now);
+        }
+    }
+
+    fn toggle_tablature_playback(&mut self) {
+        if self.tablature_playing {
+            self.tablature_playing = false;
+            self.tablature_pause_started = Some(Instant::now());
+            return;
+        }
+
+        if let Some(paused_at) = self.tablature_pause_started.take() {
+            let pause_duration = paused_at.elapsed();
+            for note in &mut self.tablature_notes {
+                note.recorded_at += pause_duration;
+            }
+            if let Some(recorded_at) = &mut self.tablature_last_recorded_at {
+                *recorded_at += pause_duration;
+            }
+        }
+        self.tablature_playing = true;
+    }
+
+    fn toggle_tablature_recording(&mut self) {
+        self.tablature_recording = !self.tablature_recording;
+        if self.tablature_recording {
+            self.tablature_last_position = None;
+            self.tablature_last_recorded_at = None;
+        }
+    }
+
+    fn clear_tablature(&mut self) {
+        self.tablature_notes.clear();
+        self.tablature_last_position = None;
+        self.tablature_last_recorded_at = None;
+    }
+
+    fn update_room_spectrum_from_buffer(
+        &mut self,
+        buffer: Option<&Arc<Mutex<LiveAnalysisBuffer>>>,
+    ) {
+        let Some(buffer) = buffer else {
+            self.room_spectrum = [0.0; ROOM_SPECTRUM_BANDS];
+            return;
+        };
+        let Ok(analysis) = buffer.lock() else {
+            return;
+        };
+        let channels = analysis.channels.max(1);
+        let total_frames = analysis.samples.len() / channels;
+        let frame_count = total_frames.min(SPECTRUM_WINDOW_FRAMES);
+        if frame_count == 0 || analysis.sample_rate <= 0.0 {
+            self.room_spectrum = [0.0; ROOM_SPECTRUM_BANDS];
+            return;
+        }
+        let sample_rate = analysis.sample_rate;
+        let start_frame = total_frames - frame_count;
+        let mut samples = Vec::with_capacity(frame_count);
+        for frame in start_frame..total_frames {
+            let first_sample = frame * channels;
+            let left = analysis.samples[first_sample];
+            let right = if channels > 1 { analysis.samples[first_sample + 1] } else { left };
+            samples.push((left + right) * 0.5);
+        }
+        drop(analysis);
+
+        let analyzer = SpectrumAnalyzer::new(sample_rate);
+        let Ok(bands) = analyzer.analyze_with_band_count(&samples, ROOM_SPECTRUM_BANDS) else {
+            return;
+        };
+        self.room_spectrum.copy_from_slice(&bands);
     }
 
     fn draw_music_loader(&mut self, ctx: &Context) {
@@ -1420,17 +2546,380 @@ impl PlayDesktop {
         self.show_music_loader = open && !close_requested;
     }
 
+    fn note_name(midi_note: u8) -> &'static str {
+        ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"][midi_note as usize % 12]
+    }
+
+    fn chord_name(chord: ChordEstimate) -> String {
+        let suffix = match chord.quality {
+            ChordQuality::Major => "",
+            ChordQuality::Minor => "m",
+            ChordQuality::Power => "5",
+            ChordQuality::Sus2 => "sus2",
+            ChordQuality::Sus4 => "sus4",
+        };
+        format!("{}{suffix}", Self::note_name(chord.root))
+    }
+
+    fn guitar_position(midi_note: u8) -> Option<(&'static str, u8)> {
+        let strings =
+            [(40_u8, "E grave"), (45, "A"), (50, "D"), (55, "G"), (59, "B"), (64, "E aiguë")];
+        strings
+            .into_iter()
+            .filter_map(|(open, name)| {
+                midi_note.checked_sub(open).filter(|fret| *fret <= 20).map(|fret| (name, fret))
+            })
+            .min_by_key(|(_, fret)| *fret)
+    }
+
+    fn tablature_line(string: &str) -> usize {
+        match string {
+            "E aiguë" => 0,
+            "B" => 1,
+            "G" => 2,
+            "D" => 3,
+            "A" => 4,
+            "E grave" => 5,
+            _ => 0,
+        }
+    }
+
+    fn draw_tablature_staff(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        note_markers: &[(f32, usize, u8)],
+    ) {
+        let strings = ["e", "B", "G", "D", "A", "E"];
+        let line_left = rect.left() + 34.0;
+        let line_right = rect.right();
+        let line_top = rect.top() + 12.0;
+        let line_bottom = rect.bottom() - 22.0;
+        let line_gap = (line_bottom - line_top) / 5.0;
+        for (index, label) in strings.iter().enumerate() {
+            let y = line_top + index as f32 * line_gap;
+            painter.line_segment(
+                [egui::pos2(line_left, y), egui::pos2(line_right, y)],
+                egui::Stroke::new(1.5, Color32::from_rgb(125, 145, 155)),
+            );
+            painter.text(
+                egui::pos2(rect.left(), y),
+                egui::Align2::LEFT_CENTER,
+                *label,
+                FontId::proportional(15.0),
+                Color32::from_gray(210),
+            );
+        }
+
+        let fret_count = 12;
+        for division in 0..=fret_count {
+            let x = line_left + (line_right - line_left) * division as f32 / fret_count as f32;
+            painter.line_segment(
+                [egui::pos2(x, line_top), egui::pos2(x, line_bottom)],
+                egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(110, 130, 145, 45)),
+            );
+        }
+
+        for &(x, line, fret) in note_markers {
+            let y = line_top + line as f32 * line_gap;
+            painter.circle_filled(egui::pos2(x, y), 10.0, Color32::from_rgb(49, 126, 123));
+            painter.text(
+                egui::pos2(x, y),
+                egui::Align2::CENTER_CENTER,
+                fret.to_string(),
+                FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    fn draw_live_tablature_panel(&self, ui: &mut Ui) {
+        let desired_size = vec2(ui.available_width(), ui.available_height().max(320.0));
+        let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::hover());
+        let rect = response.rect;
+        painter.rect_filled(rect, 8.0, Color32::from_rgb(21, 25, 35));
+        let content = rect.shrink2(vec2(18.0, 14.0));
+        painter.text(
+            content.left_top(),
+            egui::Align2::LEFT_TOP,
+            "TABLATURE GUITARE",
+            FontId::proportional(16.0),
+            Color32::from_gray(210),
+        );
+
+        if let Some(chord) = self.microphone_chord {
+            painter.text(
+                content.right_top(),
+                egui::Align2::RIGHT_TOP,
+                format!("Accord : {}", Self::chord_name(chord)),
+                FontId::proportional(14.0),
+                Color32::from_rgb(110, 220, 190),
+            );
+        }
+
+        let staff_area = egui::Rect::from_min_max(
+            egui::pos2(content.left(), content.top() + 36.0),
+            egui::pos2(content.right(), content.bottom() - 30.0),
+        );
+        let staff_height = 112.0;
+        let staff_step = 145.0;
+        let staff_count =
+            ((staff_area.height() + staff_step - staff_height) / staff_step).floor() as usize;
+        let visible_staff_count = staff_count.max(1);
+        let mut notes_by_staff: Vec<Vec<(f32, usize, u8)>> = vec![Vec::new(); visible_staff_count];
+        let line_left = staff_area.left() + 34.0;
+        let line_right = staff_area.right();
+        let seconds_per_staff = ((line_right - line_left) / TABLATURE_NOTE_SPACING_PX
+            * TABLATURE_NOTE_REPEAT_SECONDS)
+            .max(TABLATURE_NOTE_REPEAT_SECONDS);
+        let now = Instant::now();
+        let visible_seconds = visible_staff_count as f32 * seconds_per_staff;
+        for note in &self.tablature_notes {
+            let age = now.duration_since(note.recorded_at).as_secs_f32();
+            if !(0.0..visible_seconds).contains(&age) {
+                continue;
+            }
+            let row = (age / seconds_per_staff).floor() as usize;
+            let progress = (age % seconds_per_staff) / seconds_per_staff;
+            let x = line_right - (line_right - line_left) * progress;
+            notes_by_staff[row].push((x, note.line, note.fret));
+        }
+        for row in 0..staff_count.max(1) {
+            let top = staff_area.top() + row as f32 * staff_step;
+            if top + staff_height > staff_area.bottom() {
+                break;
+            }
+            let staff_rect = egui::Rect::from_min_max(
+                egui::pos2(staff_area.left(), top),
+                egui::pos2(staff_area.right(), top + staff_height),
+            );
+            Self::draw_tablature_staff(&painter, staff_rect, &notes_by_staff[row]);
+        }
+
+        if let Some(pitch) = self.microphone_pitch {
+            if let Some((_, fret)) = Self::guitar_position(pitch.midi_note) {
+                painter.text(
+                    egui::pos2(content.left(), content.bottom()),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!(
+                        "{}{} • {:.1} Hz • {:+.1} cents • case {}",
+                        Self::note_name(pitch.midi_note),
+                        pitch.midi_note / 12 - 1,
+                        pitch.frequency,
+                        pitch.cents,
+                        fret
+                    ),
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(110, 220, 190),
+                );
+            }
+        } else {
+            painter.text(
+                content.center(),
+                egui::Align2::CENTER_CENTER,
+                "Jouez une note de guitare",
+                FontId::proportional(20.0),
+                Color32::from_gray(145),
+            );
+        }
+    }
+
+    fn draw_microphone_controls(&mut self, ui: &mut Ui) {
+        if self.microphone_devices.is_empty() {
+            self.refresh_microphone_devices();
+        }
+        let names: Vec<String> = self.microphone_devices.iter().map(ToString::to_string).collect();
+        let previous_index = self.microphone_device_index;
+        let mut refresh = false;
+        ui.horizontal(|ui| {
+            ui.label("Entrée audio");
+            egui::ComboBox::from_id_salt("microphone_input_device")
+                .selected_text(
+                    names
+                        .get(self.microphone_device_index)
+                        .map(String::as_str)
+                        .unwrap_or("Aucune entrée"),
+                )
+                .show_ui(ui, |ui| {
+                    for (index, name) in names.iter().enumerate() {
+                        ui.selectable_value(&mut self.microphone_device_index, index, name);
+                    }
+                });
+            if ui.button("Actualiser").clicked() {
+                refresh = true;
+            }
+        });
+        if refresh {
+            self.refresh_microphone_devices();
+        }
+        if self.microphone_device_index != previous_index || refresh {
+            self.stop_microphone();
+            if matches!(self.scene.mode, WorkspaceMode::RoomAnalyzer | WorkspaceMode::LiveTablature)
+            {
+                self.start_microphone();
+            }
+        }
+    }
+
+    fn draw_room_analyzer(&mut self, ui: &mut Ui) {
+        Frame::new()
+            .fill(Color32::from_rgb(29, 34, 43))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Room Analyzer");
+                    ui.separator();
+                    if self.microphone_error.is_some() {
+                        ui.colored_label(Color32::LIGHT_RED, "Micro indisponible");
+                    } else {
+                        ui.colored_label(Color32::from_rgb(110, 220, 190), "Micro actif");
+                    }
+                });
+                self.draw_microphone_controls(ui);
+                if let Some(error) = &self.microphone_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                ui.add_space(6.0);
+                self.draw_room_spectrum(ui);
+            });
+    }
+
+    fn draw_live_tablature(&mut self, ui: &mut Ui) {
+        Frame::new()
+            .fill(Color32::from_rgb(29, 34, 43))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Live Tablature");
+                    ui.separator();
+                    if self.microphone_error.is_some() {
+                        ui.colored_label(Color32::LIGHT_RED, "Micro indisponible");
+                    } else {
+                        ui.colored_label(Color32::from_rgb(110, 220, 190), "Écoute du micro");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let tablature = ui.selectable_label(!self.live_tab_strumming, "🎸 TABLATURE");
+                    let strumming = ui.selectable_label(self.live_tab_strumming, "↕ STRUMMING");
+                    if tablature.clicked() {
+                        self.live_tab_strumming = false;
+                    }
+                    if strumming.clicked() {
+                        self.live_tab_strumming = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Mode");
+                    egui::ComboBox::from_id_salt("live_tab_mode")
+                        .selected_text("Gamme / accords guitare")
+                        .show_ui(ui, |ui| {
+                            let _ = ui.selectable_label(true, "Gamme / accords guitare");
+                            let _ = ui.selectable_label(false, "Notes seules");
+                        });
+                    let metronome_label =
+                        if self.metronome_enabled { "Métronome : ON" } else { "Métronome : OFF" };
+                    if ui.button(metronome_label).clicked() {
+                        self.metronome_enabled = !self.metronome_enabled;
+                    }
+                });
+                self.draw_microphone_controls(ui);
+                ui.horizontal(|ui| {
+                    if ui.button("Exemple immédiat • 8 notes").clicked() {
+                        self.clear_tablature();
+                        self.tablature_recording = true;
+                        self.tablature_playing = true;
+                    }
+                    if ui.button("Nouvel exercice").clicked() {
+                        self.clear_tablature();
+                        self.tablature_recording = true;
+                        self.tablature_playing = true;
+                    }
+                    if ui.button("Effacer").clicked() {
+                        self.clear_tablature();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("BPM");
+                    ui.add(
+                        egui::DragValue::new(&mut self.metronome_bpm)
+                            .range(30.0..=240.0)
+                            .speed(1.0),
+                    );
+                    egui::ComboBox::from_id_salt("live_tab_time_signature")
+                        .selected_text("4/4")
+                        .show_ui(ui, |ui| {
+                            let _ = ui.selectable_label(true, "4/4");
+                            let _ = ui.selectable_label(false, "3/4");
+                            let _ = ui.selectable_label(false, "6/8");
+                        });
+                    if ui
+                        .button(if self.metronome_enabled {
+                            "Arrêter rythme"
+                        } else {
+                            "Démarrer rythme"
+                        })
+                        .clicked()
+                    {
+                        self.metronome_enabled = !self.metronome_enabled;
+                    }
+                    if ui.button("T−").clicked() {
+                        self.metronome_bpm = (self.metronome_bpm - 5.0).max(30.0);
+                    }
+                    let play_label = if self.tablature_playing { "Pause" } else { "Play" };
+                    if ui.button(play_label).clicked() {
+                        self.toggle_tablature_playback();
+                    }
+                    let record_label = if self.tablature_recording {
+                        "■ Arrêter l'enregistrement"
+                    } else {
+                        "● Enregistrer les notes"
+                    };
+                    if ui.button(record_label).clicked() {
+                        self.toggle_tablature_recording();
+                    }
+                    ui.colored_label(
+                        if self.tablature_recording {
+                            Color32::from_rgb(230, 95, 95)
+                        } else {
+                            Color32::from_gray(150)
+                        },
+                        if self.tablature_recording {
+                            "Enregistrement des notes actif"
+                        } else {
+                            "Enregistrement arrêté"
+                        },
+                    );
+                });
+                if let Some(error) = &self.microphone_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                ui.add_space(6.0);
+                self.draw_live_tablature_panel(ui);
+            });
+    }
+
     fn draw_ui(&mut self, root_ui: &mut egui::Ui) {
         self.poll_metadata_loading();
+        if let Some(player) = self.audio_player.as_ref() {
+            self.resume_position_seconds = player.get_pos().as_secs_f32();
+            if (self.resume_position_seconds - self.last_saved_position_seconds).abs() >= 1.0 {
+                self.save_playlist();
+                self.last_saved_position_seconds = self.resume_position_seconds;
+            }
+        }
         if self.workspace.transport == TransportState::Playing
             && self.audio_player.as_ref().is_some_and(rodio::Player::empty)
         {
-            self.audio_player = None;
-            self.analysis_buffer = None;
-            self.workspace.stop();
+            self.finish_track();
         }
+        self.update_chain_transition();
 
-        self.update_spectrum_from_playback();
+        if self.scene.mode == WorkspaceMode::Player {
+            self.update_spectrum_from_playback();
+        } else {
+            self.update_spectrum_from_microphone();
+        }
 
         egui::Panel::top("top_toolbar")
             .frame(
@@ -1441,16 +2930,27 @@ impl PlayDesktop {
             .show(root_ui, |ui| {
                 self.draw_toolbar(ui);
             });
-        egui::Panel::right("stereo_meter").exact_size(170.0).show(root_ui, |ui| {
-            self.draw_stereo_meter_panel(ui);
-        });
-        egui::CentralPanel::default().show(root_ui, |ui| {
-            ui.add_space(CONTENT_GAP);
-            self.draw_track_list(ui);
-            ui.add_space(CONTENT_GAP);
-            self.draw_track_info(ui);
-            ui.add_space(CONTENT_GAP);
-            self.draw_spectrum(ui);
+        if self.scene.mode == WorkspaceMode::Player {
+            egui::Panel::right("stereo_meter").exact_size(170.0).show(root_ui, |ui| {
+                self.draw_stereo_meter_panel(ui);
+            });
+        }
+        egui::CentralPanel::default().show(root_ui, |ui| match self.scene.mode {
+            WorkspaceMode::Player => {
+                ui.add_space(PLAYER_CONTENT_GAP);
+                self.draw_track_list(ui);
+                ui.add_space(PLAYER_CONTENT_GAP);
+                self.draw_track_info(ui);
+                ui.add_space(PLAYER_CONTENT_GAP);
+                self.draw_spectrum(ui);
+            }
+            WorkspaceMode::RoomAnalyzer => self.draw_room_analyzer(ui),
+            WorkspaceMode::LiveTablature => self.draw_live_tablature(ui),
+            WorkspaceMode::UiLab => {
+                ui.add_space(CONTENT_GAP);
+                ui.heading("UI Lab");
+                ui.label("Mode de prototypage de l'interface.");
+            }
         });
         self.draw_music_loader(&self.egui_context.clone());
         self.egui_context.request_repaint_after(std::time::Duration::from_millis(33));
@@ -1483,6 +2983,12 @@ impl PlayDesktop {
     }
 }
 
+impl Drop for PlayDesktop {
+    fn drop(&mut self) {
+        self.stop_microphone();
+    }
+}
+
 impl ApplicationHandler for PlayDesktop {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.initialize_window(event_loop);
@@ -1502,7 +3008,10 @@ impl ApplicationHandler for PlayDesktop {
             let _ = state.on_window_event(&window, &event);
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_playlist();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(painter) = self.painter.as_mut()
                     && let (Some(width), Some(height)) =

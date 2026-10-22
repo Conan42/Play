@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub enum WorkspaceMode {
     Player,
     RoomAnalyzer,
+    LiveTablature,
     UiLab,
 }
 
@@ -30,6 +31,10 @@ pub enum TransportState {
 pub struct Track {
     pub title: String,
     pub artist: String,
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub year: Option<u16>,
     pub duration_seconds: f32,
 }
 
