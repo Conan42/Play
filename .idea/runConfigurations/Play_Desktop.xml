@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Play Desktop" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+  <configuration default="false" name="Play Desktop" type="CargoCommandRunConfiguration" factoryName="Cargo Command" singleton="false">
     <option name="command" value="run --package play-desktop --bin play" />
     <option name="workingDirectory" value="file://$PROJECT_DIR$" />
     <envs />

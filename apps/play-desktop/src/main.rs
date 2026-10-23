@@ -105,17 +105,54 @@ struct ToolbarTextures {
     menu_pressed: TextureHandle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum RepeatMode {
     Track,
     All,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum ChainMode {
     Normal,
     VolumeFader,
     TempoFader,
+    VolumeTempoFader,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TablatureDisplayMode {
+    Tablature,
+    Staff,
+    Both,
+}
+
+impl TablatureDisplayMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tablature => "Tablature",
+            Self::Staff => "Portée",
+            Self::Both => "Portée + tablature",
+        }
+    }
+}
+
+impl ChainMode {
+    fn has_volume_fader(self) -> bool {
+        matches!(self, Self::VolumeFader | Self::VolumeTempoFader)
+    }
+
+    fn has_tempo_fader(self) -> bool {
+        matches!(self, Self::TempoFader | Self::VolumeTempoFader)
+    }
+
+    fn from_faders(volume: bool, tempo: bool) -> Self {
+        match (volume, tempo) {
+            (true, true) => Self::VolumeTempoFader,
+            (true, false) => Self::VolumeFader,
+            (false, true) => Self::TempoFader,
+            (false, false) => Self::Normal,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -208,6 +245,18 @@ struct SavedPlaylist {
     selected_track: Option<usize>,
     #[serde(default)]
     position_seconds: f32,
+    #[serde(default)]
+    repeat_mode: Option<RepeatMode>,
+    #[serde(default)]
+    shuffle_enabled: bool,
+    #[serde(default)]
+    chain_mode: Option<ChainMode>,
+    #[serde(default = "default_chain_transition_seconds")]
+    chain_transition_seconds: f32,
+}
+
+fn default_chain_transition_seconds() -> f32 {
+    30.0
 }
 
 fn playlist_storage_path() -> Option<PathBuf> {
@@ -230,6 +279,7 @@ struct TablatureNote {
     recorded_at: Instant,
     line: usize,
     fret: u8,
+    midi_note: u8,
 }
 
 #[derive(Clone)]
@@ -269,6 +319,7 @@ impl LiveAnalysisBuffer {
 struct ChannelGainSource<I> {
     input: I,
     gains: Arc<Mutex<[f32; 2]>>,
+    transition_gain: Option<Arc<Mutex<f32>>>,
     analysis: Arc<Mutex<LiveAnalysisBuffer>>,
     pending_analysis: Vec<f32>,
     channels: usize,
@@ -284,11 +335,17 @@ impl<I> ChannelGainSource<I> {
         Self {
             input,
             gains,
+            transition_gain: None,
             analysis,
             pending_analysis: Vec::with_capacity(channels * 512),
             channels,
             channel: 0,
         }
+    }
+
+    fn with_transition_gain(mut self, transition_gain: Arc<Mutex<f32>>) -> Self {
+        self.transition_gain = Some(transition_gain);
+        self
     }
 
     fn flush_analysis(&mut self) {
@@ -326,8 +383,13 @@ where
             1 => gains[1],
             _ => (gains[0] + gains[1]) * 0.5,
         };
+        let transition_gain = self
+            .transition_gain
+            .as_ref()
+            .and_then(|gain| gain.lock().ok().map(|gain| *gain))
+            .unwrap_or(1.0);
         self.channel = (self.channel + 1) % self.channels;
-        Some(sample * gain)
+        Some(sample * gain * transition_gain)
     }
 }
 
@@ -588,6 +650,8 @@ struct PlayDesktop {
     workspace: Workspace,
     scene: Scene,
     repeat_mode: Option<RepeatMode>,
+    shuffle_enabled: bool,
+    shuffle_state: u64,
     chain_mode: Option<ChainMode>,
     chain_transition_seconds: f32,
     show_music_loader: bool,
@@ -601,14 +665,20 @@ struct PlayDesktop {
     selected_track: Option<usize>,
     resume_position_seconds: f32,
     last_saved_position_seconds: f32,
+    track_scroll_target: Option<usize>,
     audio_metadata: Option<AudioMetadata>,
     metadata_loading: Option<mpsc::Receiver<(usize, AudioMetadata)>>,
     metadata_sender: Option<mpsc::Sender<(usize, AudioMetadata)>>,
     metadata_pending: usize,
     audio_output: Option<rodio::MixerDeviceSink>,
     audio_player: Option<rodio::Player>,
+    chain_previous_player: Option<rodio::Player>,
     chain_transition: Option<ChainMode>,
     chain_transition_started: Option<Instant>,
+    chain_transition_gain: Option<Arc<Mutex<f32>>>,
+    chain_transition_trigger_position: Option<f32>,
+    chain_tempo_start_speed: Option<f32>,
+    chain_tempo_target_speed: Option<f32>,
     audio_error: Option<String>,
     stereo_faders: [f32; 2],
     stereo_link_drag_start: Option<[f32; 2]>,
@@ -635,6 +705,8 @@ struct PlayDesktop {
     tablature_notes: VecDeque<TablatureNote>,
     tablature_last_position: Option<(usize, u8)>,
     tablature_last_recorded_at: Option<Instant>,
+    tablature_measure_origin: Option<Instant>,
+    tablature_display_mode: TablatureDisplayMode,
     toolbar_textures: ToolbarTextures,
 }
 
@@ -673,8 +745,10 @@ impl PlayDesktop {
             workspace: Workspace::default(),
             scene: Scene::default(),
             repeat_mode: None,
+            shuffle_enabled: false,
+            shuffle_state: 0x9e37_79b9_7f4a_7c15,
             chain_mode: None,
-            chain_transition_seconds: 2.0,
+            chain_transition_seconds: 30.0,
             show_music_loader: false,
             loaded_music: Vec::new(),
             track_covers: Vec::new(),
@@ -686,14 +760,20 @@ impl PlayDesktop {
             selected_track: None,
             resume_position_seconds: 0.0,
             last_saved_position_seconds: 0.0,
+            track_scroll_target: None,
             audio_metadata: None,
             metadata_loading: None,
             metadata_sender: None,
             metadata_pending: 0,
             audio_output: None,
             audio_player: None,
+            chain_previous_player: None,
             chain_transition: None,
             chain_transition_started: None,
+            chain_transition_gain: None,
+            chain_transition_trigger_position: None,
+            chain_tempo_start_speed: None,
+            chain_tempo_target_speed: None,
             audio_error: None,
             stereo_faders: [0.8; 2],
             stereo_link_drag_start: None,
@@ -720,6 +800,8 @@ impl PlayDesktop {
             tablature_notes: VecDeque::new(),
             tablature_last_position: None,
             tablature_last_recorded_at: None,
+            tablature_measure_origin: None,
+            tablature_display_mode: TablatureDisplayMode::Tablature,
             toolbar_textures,
         };
         app.restore_playlist();
@@ -1034,11 +1116,13 @@ impl PlayDesktop {
                 let mut repeat_track = self.repeat_mode == Some(RepeatMode::Track);
                 if ui.checkbox(&mut repeat_track, "Répéter seul").changed() {
                     self.repeat_mode = repeat_track.then_some(RepeatMode::Track);
+                    self.save_playlist();
                     ui.close();
                 }
                 let mut repeat_all = self.repeat_mode == Some(RepeatMode::All);
                 if ui.checkbox(&mut repeat_all, "Répéter tout").changed() {
                     self.repeat_mode = repeat_all.then_some(RepeatMode::All);
+                    self.save_playlist();
                     ui.close();
                 }
             });
@@ -1047,27 +1131,44 @@ impl PlayDesktop {
                 toolbar_menu_button(ui, &self.toolbar_textures, "\u{e05f}", "Enchaîner");
             egui::Popup::menu(&chain_response).show(|ui| {
                 ui.set_min_width(250.0);
-                let mut chain_normal = self.chain_mode == Some(ChainMode::Normal);
+                let mut chain_normal = self.chain_mode.is_some();
                 if ui.checkbox(&mut chain_normal, "Enchaîner").changed() {
-                    self.chain_mode = chain_normal.then_some(ChainMode::Normal);
+                    if chain_normal {
+                        self.chain_mode = Some(ChainMode::Normal);
+                    } else {
+                        self.chain_mode = None;
+                    }
+                    self.save_playlist();
                     ui.close();
                 }
-                let mut chain_volume = self.chain_mode == Some(ChainMode::VolumeFader);
+                let mut chain_volume = self.chain_mode.is_some_and(ChainMode::has_volume_fader);
                 if ui.checkbox(&mut chain_volume, "Enchaîner avec fader volume").changed() {
-                    self.chain_mode = chain_volume.then_some(ChainMode::VolumeFader);
+                    let tempo = self.chain_mode.is_some_and(ChainMode::has_tempo_fader);
+                    self.chain_mode = Some(ChainMode::from_faders(chain_volume, tempo));
+                    self.save_playlist();
                     ui.close();
                 }
-                let mut chain_tempo = self.chain_mode == Some(ChainMode::TempoFader);
+                let mut chain_tempo = self.chain_mode.is_some_and(ChainMode::has_tempo_fader);
                 if ui.checkbox(&mut chain_tempo, "Enchaîner avec fader tempo").changed() {
-                    self.chain_mode = chain_tempo.then_some(ChainMode::TempoFader);
+                    let volume = self.chain_mode.is_some_and(ChainMode::has_volume_fader);
+                    self.chain_mode = Some(ChainMode::from_faders(volume, chain_tempo));
+                    self.save_playlist();
                     ui.close();
+                }
+                if ui.checkbox(&mut self.shuffle_enabled, "Ordre aléatoire").changed() {
+                    self.save_playlist();
                 }
                 ui.separator();
-                ui.add(
-                    egui::Slider::new(&mut self.chain_transition_seconds, 0.0..=10.0)
-                        .text("Durée")
-                        .suffix(" s"),
-                );
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.chain_transition_seconds, 0.0..=30.0)
+                            .text("Durée")
+                            .suffix(" s"),
+                    )
+                    .changed()
+                {
+                    self.save_playlist();
+                }
             });
 
             toolbar_separator(ui);
@@ -1182,6 +1283,7 @@ impl PlayDesktop {
         self.tablature_notes.clear();
         self.tablature_last_position = None;
         self.tablature_last_recorded_at = None;
+        self.tablature_measure_origin = None;
         if self.scene.mode != WorkspaceMode::Player {
             self.stereo_spectrum = [[0.0; SPECTRUM_BANDS]; 2];
             self.room_spectrum = [0.0; ROOM_SPECTRUM_BANDS];
@@ -1212,10 +1314,38 @@ impl PlayDesktop {
             }
             return;
         };
+        if self.shuffle_enabled && offset > 0 {
+            let next = self.random_track_index(current, track_count);
+            let transition = self.chain_transition_mode();
+            self.play_track_with_transition(next, transition);
+            return;
+        }
         let next = current as isize + offset;
         if next >= 0 && (next as usize) < track_count {
-            self.play_track(next as usize);
+            let transition = self.chain_transition_mode();
+            self.play_track_with_transition(next as usize, transition);
         }
+    }
+
+    fn chain_transition_mode(&self) -> Option<ChainMode> {
+        self.chain_mode
+            .filter(|mode| *mode != ChainMode::Normal && self.chain_transition_seconds > 0.0)
+    }
+
+    fn random_track_index(&mut self, current: usize, track_count: usize) -> usize {
+        if track_count <= 1 {
+            return 0;
+        }
+        let mut state = self.shuffle_state;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        self.shuffle_state = state;
+        let mut next = (state % track_count as u64) as usize;
+        if next == current {
+            next = (next + 1) % track_count;
+        }
+        next
     }
 
     fn restore_playlist(&mut self) {
@@ -1224,6 +1354,16 @@ impl PlayDesktop {
         let Ok(saved) = ron::from_str::<SavedPlaylist>(&contents) else { return };
         let saved_selected_track = saved.selected_track;
         let saved_position_seconds = saved.position_seconds.max(0.0);
+        let saved_repeat_mode = saved.repeat_mode;
+        let saved_shuffle_enabled = saved.shuffle_enabled;
+        let saved_chain_mode = saved.chain_mode;
+        let saved_chain_transition_seconds = if saved.layout_version < 2 {
+            default_chain_transition_seconds()
+        } else if saved.chain_transition_seconds.is_finite() {
+            saved.chain_transition_seconds.clamp(0.0, 30.0)
+        } else {
+            default_chain_transition_seconds()
+        };
         if !saved.column_order.is_empty() {
             self.track_column_order = Self::normalize_column_order(saved.column_order);
         }
@@ -1239,6 +1379,10 @@ impl PlayDesktop {
         for path in saved.paths {
             self.add_music_path(PathBuf::from(path));
         }
+        self.repeat_mode = saved_repeat_mode;
+        self.shuffle_enabled = saved_shuffle_enabled;
+        self.chain_mode = saved_chain_mode;
+        self.chain_transition_seconds = saved_chain_transition_seconds;
         self.selected_track = saved_selected_track
             .filter(|index| *index < self.loaded_music.len())
             .or(self.selected_track);
@@ -1276,7 +1420,7 @@ impl PlayDesktop {
                 .copied()
                 .filter(|column| self.track_column_visible[column.index()])
                 .collect(),
-            layout_version: 1,
+            layout_version: 2,
             selected_track: self.selected_track,
             position_seconds: self
                 .audio_player
@@ -1284,6 +1428,10 @@ impl PlayDesktop {
                 .map(|player| player.get_pos().as_secs_f32())
                 .unwrap_or(self.resume_position_seconds)
                 .max(0.0),
+            repeat_mode: self.repeat_mode,
+            shuffle_enabled: self.shuffle_enabled,
+            chain_mode: self.chain_mode,
+            chain_transition_seconds: self.chain_transition_seconds,
         };
         let Ok(contents) = ron::to_string(&saved) else { return };
         let _ = std::fs::write(path, contents);
@@ -1514,6 +1662,8 @@ impl PlayDesktop {
             - TRACK_LIST_INNER_MARGIN)
             .max(TRACK_HEADER_HEIGHT);
         let mut clicked_track = None;
+        let scroll_target = self.track_scroll_target;
+        let mut scrolled_to_target = false;
         let visible_columns: Vec<_> = self
             .track_column_order
             .iter()
@@ -1627,6 +1777,13 @@ impl PlayDesktop {
                                             ui.id().with(("track_row", index)),
                                             Sense::click(),
                                         );
+                                        if scroll_target == Some(index) {
+                                            ui.scroll_to_rect(
+                                                row.response.rect,
+                                                Some(egui::Align::Center),
+                                            );
+                                            scrolled_to_target = true;
+                                        }
                                         if row_response.clicked() {
                                             clicked_track = Some(index);
                                         }
@@ -1650,6 +1807,10 @@ impl PlayDesktop {
                     },
                 );
             });
+
+        if scrolled_to_target {
+            self.track_scroll_target = None;
+        }
 
         if let Some(index) = clicked_track {
             self.play_track(index);
@@ -1691,12 +1852,25 @@ impl PlayDesktop {
                         self.workspace.document.tracks.get(index).map(|track| track.album.clone());
                     let track_year =
                         self.workspace.document.tracks.get(index).and_then(|track| track.year);
+                    let track_duration = self
+                        .workspace
+                        .document
+                        .tracks
+                        .get(index)
+                        .map(|track| track.duration_seconds)
+                        .unwrap_or(0.0);
                     let cover = self.track_covers.get(index).and_then(Option::as_ref).cloned();
                     let metadata = self
                         .audio_metadata
                         .clone()
                         .or_else(|| self.track_metadata.get(index).and_then(Clone::clone));
                     let audio_error = self.audio_error.clone();
+                    let playback_position = self
+                        .audio_player
+                        .as_ref()
+                        .map(|player| player.get_pos().as_secs_f32())
+                        .unwrap_or(self.resume_position_seconds);
+                    let fader_status = self.fader_status_text();
                     let cover_size = (TRACK_INFO_HEIGHT - 16.0).max(0.0);
                     ui.horizontal(|ui| {
                         if let Some(cover) = cover.as_ref() {
@@ -1769,6 +1943,19 @@ impl PlayDesktop {
                                         right.small(format!("Genre : {genre}"));
                                     }
                                 }
+                                let duration = metadata
+                                    .as_ref()
+                                    .map(|metadata| metadata.duration_seconds)
+                                    .filter(|duration| *duration > 0.0)
+                                    .unwrap_or(track_duration);
+                                right.small(format!(
+                                    "Position : {} / {}",
+                                    Self::format_time(playback_position),
+                                    Self::format_time(duration)
+                                ));
+                                if let Some(status) = &fader_status {
+                                    right.colored_label(Color32::from_rgb(235, 190, 95), status);
+                                }
                                 if let Some(error) = &audio_error {
                                     right.colored_label(Color32::LIGHT_RED, error);
                                 }
@@ -1789,6 +1976,28 @@ impl PlayDesktop {
     fn format_time(seconds: f32) -> String {
         let seconds = seconds.max(0.0) as u64;
         format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    }
+
+    fn fader_status_text(&self) -> Option<String> {
+        let mode = self.chain_mode?;
+        let mode_label = match mode {
+            ChainMode::VolumeFader => "volume",
+            ChainMode::TempoFader => "tempo",
+            ChainMode::VolumeTempoFader => "volume + tempo",
+            ChainMode::Normal => return None,
+        };
+        let duration = self.chain_transition_seconds.max(0.01);
+        let state = if let Some(started) = self.chain_transition_started {
+            let elapsed = started.elapsed().as_secs_f32().min(duration);
+            format!("actif {:.1}/{:.1} s", elapsed, duration)
+        } else {
+            format!("prêt, durée {:.1} s", duration)
+        };
+        let trigger = self
+            .chain_transition_trigger_position
+            .map(Self::format_time)
+            .unwrap_or_else(|| "jamais".to_owned());
+        Some(format!("Fader {mode_label} : {state} • déclenché à {trigger}"))
     }
 
     fn format_sample_rate(sample_rate: u32) -> String {
@@ -2057,8 +2266,15 @@ impl PlayDesktop {
         if let Some(player) = self.audio_player.take() {
             player.stop();
         }
+        if let Some(player) = self.chain_previous_player.take() {
+            player.stop();
+        }
         self.chain_transition = None;
         self.chain_transition_started = None;
+        self.chain_transition_gain = None;
+        self.chain_transition_trigger_position = None;
+        self.chain_tempo_start_speed = None;
+        self.chain_tempo_target_speed = None;
         self.resume_position_seconds = 0.0;
         self.analysis_buffer = None;
         self.audio_metadata = None;
@@ -2069,19 +2285,30 @@ impl PlayDesktop {
     }
 
     fn play_track(&mut self, index: usize) {
-        self.play_track_with_transition(index, None);
+        let transition = (self.audio_player.is_some() && self.selected_track != Some(index))
+            .then(|| self.chain_transition_mode())
+            .flatten();
+        self.play_track_with_transition(index, transition);
     }
 
     fn play_track_with_transition(&mut self, index: usize, transition: Option<ChainMode>) {
         let Some(path) = self.loaded_music.get(index).cloned() else {
             return;
         };
+        let previous_bpm = self.audio_metadata.as_ref().and_then(|metadata| metadata.bpm);
         let transition = transition
             .filter(|mode| *mode != ChainMode::Normal && self.chain_transition_seconds > 0.0);
+        let transition_trigger_position = transition.map(|_| {
+            self.audio_player
+                .as_ref()
+                .map(|player| player.get_pos().as_secs_f32())
+                .unwrap_or(self.resume_position_seconds)
+        });
 
         let resume_position =
             if self.selected_track == Some(index) { self.resume_position_seconds } else { 0.0 };
         self.selected_track = Some(index);
+        self.track_scroll_target = Some(index);
         self.resume_position_seconds = resume_position;
         self.last_saved_position_seconds = resume_position;
         if self.track_metadata.get(index).is_some_and(Option::is_none)
@@ -2089,11 +2316,30 @@ impl PlayDesktop {
         {
             self.queue_metadata_load(index, path.clone());
         }
-        if let Some(player) = self.audio_player.take() {
+        // Pendant un fader de volume, l'ancien lecteur reste dans le mixer. Son
+        // volume descendra en même temps que celui de la nouvelle piste monte.
+        // Toute ancienne transition encore active est interrompue avant de
+        // commencer la nouvelle.
+        if let Some(player) = self.chain_previous_player.take() {
             player.stop();
         }
+        let previous_player = if transition.is_some() {
+            self.audio_player.take().map(|player| {
+                player.set_volume(1.0);
+                player
+            })
+        } else {
+            if let Some(player) = self.audio_player.take() {
+                player.stop();
+            }
+            None
+        };
+        self.chain_previous_player = previous_player;
         self.chain_transition = None;
         self.chain_transition_started = None;
+        self.chain_transition_gain = None;
+        self.chain_tempo_start_speed = None;
+        self.chain_tempo_target_speed = None;
         self.analysis_buffer = None;
         self.audio_metadata = None;
         self.channel_levels = [0.0; 2];
@@ -2101,6 +2347,9 @@ impl PlayDesktop {
         self.workspace.stop();
         self.audio_error = None;
 
+        let transition_gain = transition
+            .is_some_and(ChainMode::has_volume_fader)
+            .then(|| Arc::new(Mutex::new(0.0_f32)));
         let result = (|| {
             if self.audio_output.is_none() {
                 let mut output = rodio::DeviceSinkBuilder::open_default_sink()
@@ -2129,24 +2378,36 @@ impl PlayDesktop {
                 channels.get() as usize,
                 sample_rate.get() as f32,
             )));
-            let source = ChannelGainSource::new(
+            let mut source = ChannelGainSource::new(
                 decoder,
                 self.channel_gains.clone(),
                 analysis_buffer.clone(),
             );
+            if let Some(gain) = &transition_gain {
+                source = source.with_transition_gain(gain.clone());
+            }
             let player = {
                 let output = self.audio_output.as_ref().expect("sortie audio initialisée");
                 rodio::Player::connect_new(output.mixer())
             };
-            match transition {
-                Some(ChainMode::VolumeFader) => player.set_volume(0.0),
-                Some(ChainMode::TempoFader) => player.set_speed(0.85),
-                _ => {}
-            }
             player.append(source);
             self.audio_player = Some(player);
             self.analysis_buffer = Some(analysis_buffer);
             self.audio_metadata = Some(metadata);
+            if transition.is_some_and(ChainMode::has_tempo_fader) {
+                if let Some(previous_player) = self.chain_previous_player.as_ref() {
+                    self.chain_tempo_start_speed = Some(previous_player.speed());
+                }
+                self.chain_tempo_target_speed = previous_bpm
+                    .zip(self.audio_metadata.as_ref().and_then(|metadata| metadata.bpm))
+                    .filter(|(previous_bpm, next_bpm)| {
+                        previous_bpm.is_finite()
+                            && next_bpm.is_finite()
+                            && *previous_bpm > 0.0
+                            && *next_bpm > 0.0
+                    })
+                    .map(|(previous_bpm, next_bpm)| (next_bpm / previous_bpm).clamp(0.5, 2.0));
+            }
             if resume_position > 0.0 {
                 let position = resume_position.min(duration_seconds.max(0.0));
                 if position > 0.0
@@ -2166,11 +2427,20 @@ impl PlayDesktop {
                 self.workspace.transport = TransportState::Playing;
                 self.chain_transition = transition;
                 self.chain_transition_started = transition.map(|_| Instant::now());
+                self.chain_transition_gain = transition_gain;
+                self.chain_transition_trigger_position = transition_trigger_position;
             }
             Err(error) => {
+                if let Some(player) = self.chain_previous_player.take() {
+                    player.stop();
+                }
                 self.audio_error = Some(error);
                 self.chain_transition = None;
                 self.chain_transition_started = None;
+                self.chain_transition_gain = None;
+                self.chain_transition_trigger_position = None;
+                self.chain_tempo_start_speed = None;
+                self.chain_tempo_target_speed = None;
                 self.workspace.stop();
             }
         }
@@ -2196,10 +2466,19 @@ impl PlayDesktop {
             // Répéter tout parcourt la liste uniquement si Enchaîner est activé.
             (Some(_), Some(RepeatMode::Track)) => (Some(current), None),
             (Some(chain_mode), Some(RepeatMode::All)) => {
-                (Some((current + 1) % track_count), Some(chain_mode))
+                let next = if self.shuffle_enabled {
+                    self.random_track_index(current, track_count)
+                } else {
+                    (current + 1) % track_count
+                };
+                (Some(next), Some(chain_mode))
             }
             (Some(chain_mode), None) => {
-                let next = (current + 1 < track_count).then_some(current + 1);
+                let next = if self.shuffle_enabled {
+                    Some(self.random_track_index(current, track_count))
+                } else {
+                    (current + 1 < track_count).then_some(current + 1)
+                };
                 (next, Some(chain_mode))
             }
         };
@@ -2212,9 +2491,16 @@ impl PlayDesktop {
             self.play_track_with_transition(next, transition);
         } else {
             self.audio_player = None;
+            if let Some(player) = self.chain_previous_player.take() {
+                player.stop();
+            }
             self.analysis_buffer = None;
             self.chain_transition = None;
             self.chain_transition_started = None;
+            self.chain_transition_gain = None;
+            self.chain_transition_trigger_position = None;
+            self.chain_tempo_start_speed = None;
+            self.chain_tempo_target_speed = None;
             self.workspace.stop();
         }
     }
@@ -2229,16 +2515,37 @@ impl PlayDesktop {
         };
         let duration = self.chain_transition_seconds.max(0.01);
         let progress = (started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
-        if let Some(player) = self.audio_player.as_ref() {
-            match mode {
-                ChainMode::VolumeFader => player.set_volume(progress),
-                ChainMode::TempoFader => player.set_speed(0.85 + progress * 0.15),
-                ChainMode::Normal => {}
+        if let Some(gain) = self.chain_transition_gain.as_ref()
+            && let Ok(mut gain) = gain.lock()
+        {
+            *gain = progress;
+        }
+        if mode.has_volume_fader() {
+            if let Some(player) = self.chain_previous_player.as_ref() {
+                player.set_volume(1.0 - progress);
             }
         }
+        if let Some(player) = self.audio_player.as_ref() {
+            if mode.has_volume_fader() {
+                player.set_volume(1.0);
+            }
+        }
+        if mode.has_tempo_fader()
+            && let (Some(start_speed), Some(target_speed)) =
+                (self.chain_tempo_start_speed, self.chain_tempo_target_speed)
+            && let Some(player) = self.chain_previous_player.as_ref()
+        {
+            player.set_speed(start_speed + (target_speed - start_speed) * progress);
+        }
         if progress >= 1.0 {
+            if let Some(player) = self.chain_previous_player.take() {
+                player.stop();
+            }
             self.chain_transition = None;
             self.chain_transition_started = None;
+            self.chain_transition_gain = None;
+            self.chain_tempo_start_speed = None;
+            self.chain_tempo_target_speed = None;
         }
     }
 
@@ -2392,10 +2699,14 @@ impl PlayDesktop {
             recorded_at.elapsed().as_secs_f32() >= TABLATURE_NOTE_REPEAT_SECONDS
         });
         if changed || repeat_due {
+            if self.tablature_measure_origin.is_none() {
+                self.tablature_measure_origin = Some(now);
+            }
             self.tablature_notes.push_back(TablatureNote {
                 recorded_at: now,
                 line: position.0,
                 fret: position.1,
+                midi_note: pitch.midi_note,
             });
             while self.tablature_notes.len() > TABLATURE_HISTORY_LIMIT {
                 self.tablature_notes.pop_front();
@@ -2414,6 +2725,9 @@ impl PlayDesktop {
 
         if let Some(paused_at) = self.tablature_pause_started.take() {
             let pause_duration = paused_at.elapsed();
+            if let Some(origin) = &mut self.tablature_measure_origin {
+                *origin += pause_duration;
+            }
             for note in &mut self.tablature_notes {
                 note.recorded_at += pause_duration;
             }
@@ -2436,6 +2750,7 @@ impl PlayDesktop {
         self.tablature_notes.clear();
         self.tablature_last_position = None;
         self.tablature_last_recorded_at = None;
+        self.tablature_measure_origin = None;
     }
 
     fn update_room_spectrum_from_buffer(
@@ -2632,16 +2947,166 @@ impl PlayDesktop {
         }
     }
 
+    fn diatonic_staff_position(midi_note: u8) -> i32 {
+        let note_in_octave = match midi_note % 12 {
+            0 | 1 => 0,
+            2 | 3 => 1,
+            4 => 2,
+            5 | 6 => 3,
+            7 | 8 => 4,
+            9 | 10 => 5,
+            11 => 6,
+            _ => 0,
+        };
+        let octave = midi_note as i32 / 12 - 1;
+        (octave + 1) * 7 + note_in_octave - 37
+    }
+
+    fn draw_standard_staff(painter: &egui::Painter, rect: egui::Rect, note_markers: &[(f32, u8)]) {
+        let painter = painter.with_clip_rect(rect);
+        let line_left = rect.left() + 44.0;
+        let line_right = rect.right();
+        let top_line = rect.top() + 65.0;
+        let line_gap = 6.0;
+        let bottom_line = top_line + line_gap * 4.0;
+        let line_color = Color32::from_rgb(165, 175, 185);
+
+        for line in 0..5 {
+            let y = top_line + line as f32 * line_gap;
+            painter.line_segment(
+                [egui::pos2(line_left, y), egui::pos2(line_right, y)],
+                egui::Stroke::new(1.4, line_color),
+            );
+        }
+        painter.text(
+            egui::pos2(rect.left() + 4.0, rect.center().y + 2.0),
+            egui::Align2::LEFT_CENTER,
+            "𝄞",
+            FontId::proportional(42.0),
+            Color32::from_gray(215),
+        );
+
+        for &(x, midi_note) in note_markers {
+            let staff_position = Self::diatonic_staff_position(midi_note);
+            let y = bottom_line - staff_position as f32 * (line_gap * 0.5);
+            let note_color = Color32::from_rgb(110, 220, 190);
+
+            if staff_position < 0 || staff_position > 8 {
+                let first = if staff_position < 0 { staff_position } else { 8 };
+                let last = if staff_position < 0 { 0 } else { staff_position };
+                for ledger in (first..=last).step_by(2) {
+                    let ledger_y = bottom_line - ledger as f32 * (line_gap * 0.5);
+                    painter.line_segment(
+                        [egui::pos2(x - 8.0, ledger_y), egui::pos2(x + 8.0, ledger_y)],
+                        egui::Stroke::new(1.2, line_color),
+                    );
+                }
+            }
+
+            painter.circle_filled(egui::pos2(x, y), 5.5, note_color);
+            painter.line_segment(
+                [egui::pos2(x + 5.0, y), egui::pos2(x + 5.0, y - 25.0)],
+                egui::Stroke::new(1.5, note_color),
+            );
+            if matches!(midi_note % 12, 1 | 3 | 6 | 8 | 10) {
+                painter.text(
+                    egui::pos2(x - 13.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    "♯",
+                    FontId::proportional(15.0),
+                    note_color,
+                );
+            }
+        }
+    }
+
+    fn draw_measure_lines(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        line_left_margin: f32,
+        top_margin: f32,
+        bottom_margin: f32,
+        row_start_age: f32,
+        seconds_per_row: f32,
+        now: Instant,
+        origin: Option<Instant>,
+        show_labels: bool,
+        bpm: f32,
+    ) {
+        let Some(origin) = origin else {
+            return;
+        };
+        let beat_seconds = 60.0 / bpm.max(30.0);
+        let measure_seconds = beat_seconds * 4.0;
+        let elapsed = now.duration_since(origin).as_secs_f32();
+        let phase = elapsed.rem_euclid(measure_seconds);
+        let row_end_age = row_start_age + seconds_per_row;
+        let first_bar_age =
+            phase + ((row_start_age - phase) / measure_seconds).ceil().max(0.0) * measure_seconds;
+        let line_left = rect.left() + line_left_margin;
+        let line_right = rect.right();
+        let line_width = line_right - line_left;
+        let line_top = rect.top() + top_margin;
+        let line_bottom = rect.bottom() - bottom_margin;
+
+        let mut bar_age = first_bar_age;
+        while bar_age <= row_end_age + f32::EPSILON {
+            for beat in 0..4 {
+                let age = bar_age + beat as f32 * beat_seconds;
+                if age < row_start_age || age > row_end_age {
+                    continue;
+                }
+                let progress = (age - row_start_age) / seconds_per_row;
+                let x = line_right - line_width * progress;
+                let is_measure = beat == 0;
+                painter.line_segment(
+                    [egui::pos2(x, line_top), egui::pos2(x, line_bottom)],
+                    egui::Stroke::new(
+                        if is_measure { 1.8 } else { 0.8 },
+                        if is_measure {
+                            Color32::from_rgba_unmultiplied(190, 205, 215, 150)
+                        } else {
+                            Color32::from_rgba_unmultiplied(145, 165, 180, 55)
+                        },
+                    ),
+                );
+                if show_labels && is_measure {
+                    let measure_number = ((elapsed - age) / measure_seconds).floor() as usize + 1;
+                    painter.text(
+                        egui::pos2(x + 4.0, rect.top() + 4.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("M{measure_number}"),
+                        FontId::proportional(10.0),
+                        Color32::from_gray(155),
+                    );
+                }
+            }
+            bar_age += measure_seconds;
+        }
+    }
+
     fn draw_live_tablature_panel(&self, ui: &mut Ui) {
         let desired_size = vec2(ui.available_width(), ui.available_height().max(320.0));
         let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::hover());
         let rect = response.rect;
         painter.rect_filled(rect, 8.0, Color32::from_rgb(21, 25, 35));
         let content = rect.shrink2(vec2(18.0, 14.0));
+        let show_standard_staff = matches!(
+            self.tablature_display_mode,
+            TablatureDisplayMode::Staff | TablatureDisplayMode::Both
+        );
+        let show_tablature = matches!(
+            self.tablature_display_mode,
+            TablatureDisplayMode::Tablature | TablatureDisplayMode::Both
+        );
         painter.text(
             content.left_top(),
             egui::Align2::LEFT_TOP,
-            "TABLATURE GUITARE",
+            match self.tablature_display_mode {
+                TablatureDisplayMode::Tablature => "TABLATURE GUITARE",
+                TablatureDisplayMode::Staff => "PORTÉE CLASSIQUE",
+                TablatureDisplayMode::Both => "PORTÉE + TABLATURE GUITARE",
+            },
             FontId::proportional(16.0),
             Color32::from_gray(210),
         );
@@ -2660,12 +3125,24 @@ impl PlayDesktop {
             egui::pos2(content.left(), content.top() + 36.0),
             egui::pos2(content.right(), content.bottom() - 30.0),
         );
-        let staff_height = 112.0;
-        let staff_step = 145.0;
+        let staff_height = match (show_standard_staff, show_tablature) {
+            (true, true) => 310.0,
+            (true, false) => 175.0,
+            (false, true) => 112.0,
+            (false, false) => 112.0,
+        };
+        let staff_step = match (show_standard_staff, show_tablature) {
+            (true, true) => 320.0,
+            (true, false) => 195.0,
+            (false, true) => 145.0,
+            (false, false) => 145.0,
+        };
         let staff_count =
             ((staff_area.height() + staff_step - staff_height) / staff_step).floor() as usize;
         let visible_staff_count = staff_count.max(1);
         let mut notes_by_staff: Vec<Vec<(f32, usize, u8)>> = vec![Vec::new(); visible_staff_count];
+        let mut standard_notes_by_staff: Vec<Vec<(f32, u8)>> =
+            vec![Vec::new(); visible_staff_count];
         let line_left = staff_area.left() + 34.0;
         let line_right = staff_area.right();
         let seconds_per_staff = ((line_right - line_left) / TABLATURE_NOTE_SPACING_PX
@@ -2682,17 +3159,54 @@ impl PlayDesktop {
             let progress = (age % seconds_per_staff) / seconds_per_staff;
             let x = line_right - (line_right - line_left) * progress;
             notes_by_staff[row].push((x, note.line, note.fret));
+            standard_notes_by_staff[row].push((x, note.midi_note));
         }
         for row in 0..staff_count.max(1) {
             let top = staff_area.top() + row as f32 * staff_step;
             if top + staff_height > staff_area.bottom() {
                 break;
             }
-            let staff_rect = egui::Rect::from_min_max(
-                egui::pos2(staff_area.left(), top),
-                egui::pos2(staff_area.right(), top + staff_height),
-            );
-            Self::draw_tablature_staff(&painter, staff_rect, &notes_by_staff[row]);
+            if show_standard_staff {
+                let standard_rect = egui::Rect::from_min_max(
+                    egui::pos2(staff_area.left(), top),
+                    egui::pos2(staff_area.right(), top + 175.0),
+                );
+                Self::draw_measure_lines(
+                    &painter,
+                    standard_rect,
+                    44.0,
+                    14.0,
+                    8.0,
+                    row as f32 * seconds_per_staff,
+                    seconds_per_staff,
+                    now,
+                    self.tablature_measure_origin,
+                    true,
+                    self.metronome_bpm,
+                );
+                Self::draw_standard_staff(&painter, standard_rect, &standard_notes_by_staff[row]);
+            }
+            if show_tablature {
+                let tablature_top = if show_standard_staff { top + 190.0 } else { top };
+                let tablature_rect = egui::Rect::from_min_max(
+                    egui::pos2(staff_area.left(), tablature_top),
+                    egui::pos2(staff_area.right(), tablature_top + 112.0),
+                );
+                Self::draw_measure_lines(
+                    &painter,
+                    tablature_rect,
+                    34.0,
+                    12.0,
+                    22.0,
+                    row as f32 * seconds_per_staff,
+                    seconds_per_staff,
+                    now,
+                    self.tablature_measure_origin,
+                    !show_standard_staff,
+                    self.metronome_bpm,
+                );
+                Self::draw_tablature_staff(&painter, tablature_rect, &notes_by_staff[row]);
+            }
         }
 
         if let Some(pitch) = self.microphone_pitch {
@@ -2817,6 +3331,26 @@ impl PlayDesktop {
                             let _ = ui.selectable_label(true, "Gamme / accords guitare");
                             let _ = ui.selectable_label(false, "Notes seules");
                         });
+                    ui.label("Affichage");
+                    egui::ComboBox::from_id_salt("live_tab_display_mode")
+                        .selected_text(self.tablature_display_mode.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.tablature_display_mode,
+                                TablatureDisplayMode::Tablature,
+                                "Tablature",
+                            );
+                            ui.selectable_value(
+                                &mut self.tablature_display_mode,
+                                TablatureDisplayMode::Staff,
+                                "Portée",
+                            );
+                            ui.selectable_value(
+                                &mut self.tablature_display_mode,
+                                TablatureDisplayMode::Both,
+                                "Portée + tablature",
+                            );
+                        });
                     let metronome_label =
                         if self.metronome_enabled { "Métronome : ON" } else { "Métronome : OFF" };
                     if ui.button(metronome_label).clicked() {
@@ -2908,9 +3442,37 @@ impl PlayDesktop {
                 self.last_saved_position_seconds = self.resume_position_seconds;
             }
         }
-        if self.workspace.transport == TransportState::Playing
-            && self.audio_player.as_ref().is_some_and(rodio::Player::empty)
-        {
+        let should_advance_track = if self.workspace.transport == TransportState::Playing {
+            match self.audio_player.as_ref() {
+                None => false,
+                Some(player) if player.empty() => true,
+                Some(player) if self.chain_transition.is_none() => {
+                    let transition_enabled = self.chain_transition_mode().is_some();
+                    let duration = self
+                        .audio_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.duration_seconds)
+                        .or_else(|| {
+                            self.selected_track.and_then(|index| {
+                                self.workspace
+                                    .document
+                                    .tracks
+                                    .get(index)
+                                    .map(|track| track.duration_seconds)
+                            })
+                        })
+                        .unwrap_or(0.0);
+                    let position = player.get_pos().as_secs_f32();
+                    transition_enabled
+                        && duration > 0.0
+                        && duration - position <= self.chain_transition_seconds.max(0.01)
+                }
+                Some(_) => false,
+            }
+        } else {
+            false
+        };
+        if should_advance_track {
             self.finish_track();
         }
         self.update_chain_transition();

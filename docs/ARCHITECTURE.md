@@ -92,6 +92,9 @@ mètres LED et les faders stéréo.
 
 ## Room Analyzer
 
+Voir aussi [`ROOM_ANALYZER.md`](ROOM_ANALYZER.md) pour le détail de la capture,
+de la résolution fréquentielle et du flux de traitement.
+
 Le Room Analyzer ouvre un flux d'entrée avec `rodio::microphone` et le place
 dans un buffer partagé avec la boucle d'interface. À chaque image, le desktop
 extrait la fenêtre audio la plus récente, la convertit en mono et la transmet à
@@ -103,20 +106,28 @@ l'entrée et les erreurs d'ouverture sont affichés au-dessus du graphe.
 
 ## Live Tablature
 
+Voir aussi [`LIVE_TABLATURE.md`](LIVE_TABLATURE.md) pour les trois modes
+d'affichage, la détection des notes et la synchronisation des mesures.
+
 Le Live Tablature réutilise le même flux d'entrée et la même fenêtre d'analyse.
 La détection de hauteur produit une note MIDI, puis `guitar_position` choisit
 la position la plus grave disponible sur les six cordes dans les vingt
 premières cases. Une détection d'accord est affichée dans l'en-tête.
 
-Les positions reconnues sont ajoutées à une file temporelle limitée. Les
-portées sont dessinées avec six lignes (`e B G D A E`) et répétées selon la
-hauteur disponible. La durée visible d'une portée dépend de sa largeur, ce
-qui permet d'afficher davantage de notes lorsque la fenêtre est agrandie.
+Les positions reconnues sont ajoutées à une file temporelle limitée. Le
+sélecteur d'affichage propose une tablature seule, une portée classique seule
+ou les deux. La tablature est dessinée avec six lignes (`e B G D A E`) et la
+portée classique avec cinq lignes et une clé de sol. Les deux systèmes
+partagent les mêmes positions de notes et les mêmes barres de mesure. La durée
+visible d'un système dépend de sa largeur, ce qui permet d'afficher davantage
+de notes lorsque la fenêtre est agrandie.
 `Play/Pause` suspend ou reprend le défilement et l'ajout de notes, tandis que
 `Enregistrer les notes` contrôle séparément la capture des positions détectées.
 Les contrôles pédagogiques comprennent les onglets `TABLATURE` et
-`STRUMMING`, le choix de mode, le BPM, la mesure, le métronome, les exercices
-et l'effacement de la tablature.
+`STRUMMING`, le choix de mode, le choix d'affichage, le BPM, la mesure, le
+métronome, les exercices et l'effacement de la tablature. L'horloge des
+mesures démarre avec la première note capturée et est suspendue avec le
+défilement.
 
 Le flux actuel est audio. La connexion MIDI directe, la lecture d'un exercice
 enregistré et la génération sonore du métronome sont des extensions à prévoir.

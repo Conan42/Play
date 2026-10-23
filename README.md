@@ -31,6 +31,16 @@ session démarre avec une liste de pistes vide et propose :
 - un double mètre stéréo à LED rondes, gradué en décibels, et deux faders L/R
   sur toute la hauteur du panneau droit, placés contre leur mètre respectif.
 
+Le mode `LiveTablature` propose trois présentations : `Tablature`, `Portée` et
+`Portée + tablature`. La portée classique et la tablature utilisent la même
+horloge. Les barres de mesure et les subdivisions de temps sont calculées à
+partir du BPM et de la mesure 4/4 affichée dans le panneau.
+
+![Capture du mode Live Tablature avec portée et tablature](docs/screenshots/live-tablature.png)
+
+Documentation détaillée : [`docs/LIVE_TABLATURE.md`](docs/LIVE_TABLATURE.md) et
+[`docs/ROOM_ANALYZER.md`](docs/ROOM_ANALYZER.md).
+
 Le mode `RoomAnalyzer` ouvre une entrée audio sélectionnable et affiche un
 analyseur mono haute résolution sur 256 bandes. Sa graduation couvre 0 à
 110 dB, avec des repères fréquentiels de 16 Hz à 23 kHz. L'analyse est faite
@@ -39,13 +49,15 @@ zone centrale disponible.
 
 Le mode `LiveTablature` reconnaît la hauteur dominante d'une guitare dans une
 entrée audio, la convertit en position sur les six cordes et affiche une
-tablature qui se remplit progressivement. Les notes détectées et les accords
-sont conservés dans une file temporelle et défilent dans les portées visibles.
-La largeur de la fenêtre détermine le nombre de notes visibles et sa hauteur
-le nombre de portées affichées. `Play/Pause` contrôle le défilement et
-l'enregistrement des notes possède sa propre commande. Le panneau comprend
-également les onglets `TABLATURE` et `STRUMMING`, les réglages BPM, mesure et
-métronome ainsi que les commandes d'exercice et d'effacement.
+tablature qui se remplit progressivement. Les notes détectées, les accords et
+les notes MIDI sont conservés dans une file temporelle et défilent dans les
+portées visibles. La largeur de la fenêtre détermine le nombre de notes
+visibles et sa hauteur le nombre de systèmes affichés. `Play/Pause` contrôle
+le défilement et l'enregistrement des notes possède sa propre commande. Le
+panneau comprend également les onglets `TABLATURE` et `STRUMMING`, les
+réglages BPM, mesure et métronome ainsi que les commandes d'exercice et
+d'effacement. La portée classique peut être affichée seule ou avec la
+tablature, avec des barres de mesure alignées sur les deux systèmes.
 
 Le chargement ajoute les fichiers et leurs titres à la liste. Un clic sur une
 piste ou sur Lecture démarre sa lecture ; Pause et Arrêt contrôlent la piste
