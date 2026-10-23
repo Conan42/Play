@@ -1,8 +1,12 @@
 # Live Tablature
 
-`LiveTablature` transforme une entrée audio de guitare en affichage musical
-progressif. Le mode utilise le même flux microphone que `RoomAnalyzer`, mais
-conserve une fenêtre temporelle de notes afin de faire défiler la partition.
+`LiveTablature` transforme une entrée audio de guitare ou de voix en affichage
+musical progressif. Il peut aussi analyser la sortie de la piste jouée par Play :
+cette source suit le signal envoyé à la sortie audio active, donc à la Scarlett si
+elle est sélectionnée comme sortie de lecture. Le mode microphone utilise le même
+flux que `RoomAnalyzer` et renvoie l'entrée vers la sortie casque active pour
+le monitoring. Les deux sources conservent une fenêtre temporelle de notes afin
+de faire défiler la partition.
 
 ## Détection
 
@@ -29,8 +33,12 @@ Le sélecteur `Affichage` propose trois modes :
 - **Portée + tablature** : les deux systèmes utilisent la même position
   horizontale pour chaque note.
 
-La hauteur du panneau détermine le nombre de systèmes visibles. Le défilement
-est commun aux trois modes et suit l'âge des notes depuis leur capture.
+La hauteur du panneau détermine le nombre de systèmes visibles. Dans chaque
+système, les notes avancent de gauche à droite selon leur instant de capture.
+Lorsque la portée courante arrive au bord droit, la séquence continue sur la
+portée suivante ; quand la hauteur disponible est pleine, la portée courante
+reste visible en bas et les portées précédentes remontent automatiquement.
+Le défilement est commun aux trois modes.
 
 ## Mesures et temps
 
@@ -48,14 +56,31 @@ séquence de mesures.
 ## Commandes
 
 - `TABLATURE` et `STRUMMING` changent la vue pédagogique ;
-- `Play/Pause` suspend ou reprend le défilement et la capture ;
+- la commande `Play/Pause` de la barre d'outils principale contrôle la piste
+  audio et reste disponible dans ce mode ;
+- `Play/Pause` de la barre basse suspend ou reprend le défilement de la
+  tablature et la capture ;
 - `Enregistrer les notes` contrôle l'ajout des notes dans l'historique ;
 - `Exemple immédiat`, `Nouvel exercice` et `Effacer` contrôlent l'historique ;
+- le sélecteur `Source analysée` choisit le microphone/entrée Scarlett ou la
+  sortie de la piste Play ; le mode microphone active aussi le monitoring vers
+  la sortie casque de la Scarlett ; le bouton `MON` permet de couper ou de
+  réactiver ce retour sans interrompre la détection ; le bouton `MONO` duplique
+  une source guitare mono dans les deux côtés du casque ;
 - le choix de l'entrée audio permet d'utiliser un microphone, une interface
   USB ou une autre entrée exposée par le système ;
+- le menu de profil microphone permet de sélectionner `Shure Beta 58A — micro
+  dynamique` lorsqu'il est branché sur l'entrée XLR de la Scarlett Solo ; ce
+  microphone dynamique ne nécessite pas l'alimentation fantôme 48 V ;
 - le BPM et le métronome servent de référence visuelle pour les mesures.
 
-La détection reste monophonique pour la position de tablature. La détection
-d'accord fournit une indication complémentaire et ne remplace pas encore une
-transcription polyphonique complète.
+La piste audio en cours reste audible lors de l'ouverture de `LiveTablature`.
+Un bandeau au-dessus du panneau affiche son titre, son artiste, son état et sa
+position de lecture. Le panneau mètre stéréo à droite reprend les niveaux du
+micro et ses faders L/R règlent directement le volume du monitoring casque.
 
+La détection reste monophonique pour la position de tablature : elle convient
+donc au chant d'une mélodie comme `Shape of My Heart` et convertit chaque note
+vocale en position équivalente sur le manche de guitare. La détection d'accord
+fournit une indication complémentaire et ne remplace pas encore une
+transcription polyphonique complète.

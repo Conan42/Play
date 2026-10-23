@@ -9,6 +9,8 @@ use thiserror::Error;
 pub const SPECTRUM_BANDS: usize = 64;
 pub const SPECTRUM_MIN_FREQUENCY: f32 = 16.0;
 pub const SPECTRUM_MAX_FREQUENCY: f32 = 23_000.0;
+const BPM_FFT_SIZE: usize = 2_048;
+const BPM_HOP_SIZE: usize = 512;
 
 #[derive(Debug, Error)]
 pub enum MediaError {
@@ -27,6 +29,152 @@ pub struct RgbaImageInfo {
 pub fn inspect_image(bytes: &[u8]) -> Result<RgbaImageInfo, MediaError> {
     let image = image::load_from_memory(bytes)?.to_rgba8();
     Ok(RgbaImageInfo { width: image.width(), height: image.height() })
+}
+
+/// Estimates a track tempo from a precomputed onset envelope.
+///
+/// envelope_rate is the number of envelope values per second. Keeping this
+/// function separate lets the desktop application analyze a decoder stream
+/// without retaining the complete audio file in memory.
+pub fn estimate_bpm_from_envelope(envelope: &[f32], envelope_rate: f32) -> Option<f32> {
+    if envelope.len() < 8 || !(envelope_rate > 0.0) {
+        return None;
+    }
+
+    let mean = envelope.iter().copied().sum::<f32>() / envelope.len() as f32;
+    let centered = envelope.iter().map(|value| (value - mean).max(0.0)).collect::<Vec<_>>();
+    let energy = centered.iter().map(|value| value * value).sum::<f32>();
+    if energy <= f32::EPSILON {
+        return None;
+    }
+
+    let min_bpm = 45.0;
+    let max_bpm = 220.0;
+    let min_lag = (envelope_rate * 60.0 / max_bpm).round().max(1.0) as usize;
+    let max_lag = (envelope_rate * 60.0 / min_bpm).round() as usize;
+    let max_lag = max_lag.min(centered.len().saturating_sub(2));
+    if min_lag > max_lag {
+        return None;
+    }
+
+    let mut best_lag = min_lag;
+    let mut best_score = 0.0;
+    for lag in min_lag..=max_lag {
+        let score = normalized_envelope_correlation(&centered, lag);
+        if score > best_score {
+            best_score = score;
+            best_lag = lag;
+        }
+    }
+
+    if best_score <= 0.08 {
+        return None;
+    }
+
+    // Autocorrelation cannot distinguish a beat from its multiples: a track
+    // at 104 BPM often produces an equally strong peak at 52 BPM, for
+    // example. Report the conventional musical tempo range so the list does
+    // not alternate between half-time and double-time values.
+    // Refine the lag between two envelope frames. The FFT hop is discrete,
+    // so this removes a few BPM of quantization error on short tracks.
+    let precise_lag = if best_lag > min_lag && best_lag < max_lag {
+        let previous = normalized_envelope_correlation(&centered, best_lag - 1);
+        let current = best_score;
+        let next = normalized_envelope_correlation(&centered, best_lag + 1);
+        let curvature = previous - 2.0 * current + next;
+        let offset = if curvature.abs() > f32::EPSILON {
+            (0.5 * (previous - next) / curvature).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        };
+        best_lag as f32 + offset
+    } else {
+        best_lag as f32
+    };
+    let mut bpm = (60.0 * envelope_rate / precise_lag).clamp(min_bpm, max_bpm);
+    while bpm < 70.0 {
+        bpm *= 2.0;
+    }
+    while bpm > 180.0 {
+        bpm *= 0.5;
+    }
+
+    Some(bpm.round())
+}
+
+fn normalized_envelope_correlation(envelope: &[f32], lag: usize) -> f32 {
+    let count = envelope.len().saturating_sub(lag);
+    if count < 2 {
+        return 0.0;
+    }
+    let mut correlation = 0.0;
+    let mut left_energy = 0.0;
+    let mut right_energy = 0.0;
+    for index in lag..envelope.len() {
+        let left = envelope[index];
+        let right = envelope[index - lag];
+        correlation += left * right;
+        left_energy += left * left;
+        right_energy += right * right;
+    }
+    correlation / (left_energy * right_energy).sqrt().max(f32::EPSILON)
+}
+
+/// Estimates tempo from mono PCM samples using spectral flux.
+///
+/// RMS follows the general loudness of a track and is easily confused by
+/// sustained notes, vocals, or bass lines. Spectral flux measures new energy
+/// between successive FFT frames, which makes drum and note attacks much more
+/// useful as beat markers. The three weighted frequency regions reduce the
+/// influence of a single dominant instrument.
+pub fn estimate_bpm_from_samples(samples: &[f32], sample_rate: f32) -> Option<f32> {
+    if samples.len() < BPM_FFT_SIZE || !(sample_rate > 0.0) {
+        return None;
+    }
+
+    let bin_rate = sample_rate / BPM_FFT_SIZE as f32;
+    let first_bin = (30.0 / bin_rate).ceil() as usize;
+    let last_bin = (5_000.0 / bin_rate).floor() as usize;
+    let last_bin = last_bin.min(BPM_FFT_SIZE / 2);
+    if first_bin >= last_bin {
+        return None;
+    }
+
+    let mut previous_magnitudes = vec![0.0_f32; BPM_FFT_SIZE / 2 + 1];
+    let mut frame = vec![(0.0_f32, 0.0_f32); BPM_FFT_SIZE];
+    let mut flux = Vec::with_capacity((samples.len() - BPM_FFT_SIZE) / BPM_HOP_SIZE + 1);
+    let window_denominator = (BPM_FFT_SIZE - 1) as f32;
+
+    for start in (0..=samples.len() - BPM_FFT_SIZE).step_by(BPM_HOP_SIZE) {
+        let mean =
+            samples[start..start + BPM_FFT_SIZE].iter().copied().sum::<f32>() / BPM_FFT_SIZE as f32;
+        for (index, sample) in samples[start..start + BPM_FFT_SIZE].iter().enumerate() {
+            let window =
+                0.5 - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / window_denominator).cos();
+            frame[index] = ((*sample - mean) * window, 0.0);
+        }
+        fft_in_place(&mut frame);
+
+        let mut band_flux = [0.0_f32; 3];
+        for bin in first_bin..=last_bin {
+            let frequency = bin as f32 * bin_rate;
+            let band = if frequency < 180.0 {
+                0
+            } else if frequency < 800.0 {
+                1
+            } else {
+                2
+            };
+            let magnitude =
+                (frame[bin].0 * frame[bin].0 + frame[bin].1 * frame[bin].1).sqrt().ln_1p();
+            band_flux[band] += (magnitude - previous_magnitudes[bin]).max(0.0);
+            previous_magnitudes[bin] = magnitude;
+        }
+        flux.push(band_flux[0] * 1.4 + band_flux[1] + band_flux[2] * 0.6);
+    }
+
+    let envelope_rate = sample_rate / BPM_HOP_SIZE as f32;
+    estimate_bpm_from_envelope(&flux, envelope_rate)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,9 +243,24 @@ impl SpectrumAnalyzer {
 
             if last_bin <= first_bin {
                 // Les premières bandes sont plus étroites que la résolution
-                // FFT. Une réutilisation du bin voisin faisait bouger deux
-                // bandes ensemble ; on mesure ici la fréquence centrale.
-                peak_power = goertzel_windowed_power(samples, self.sample_rate, center, mean);
+                // FFT. Pour l'analyse standard, Goertzel conserve la finesse
+                // de détection des basses fréquences. En haute résolution,
+                // réutiliser toute la fenêtre pour chaque bande monopoliserait
+                // le thread de l'interface ; on interpole alors la puissance
+                // des deux bins FFT qui entourent la fréquence centrale.
+                if band_count > SPECTRUM_BANDS {
+                    let position = (center * fft_len as f32 / self.sample_rate)
+                        .clamp(1.0, (fft_len / 2) as f32);
+                    let lower_bin = position.floor() as usize;
+                    let upper_bin = position.ceil() as usize;
+                    let lower_power =
+                        fft[lower_bin].0 * fft[lower_bin].0 + fft[lower_bin].1 * fft[lower_bin].1;
+                    let upper_power =
+                        fft[upper_bin].0 * fft[upper_bin].0 + fft[upper_bin].1 * fft[upper_bin].1;
+                    peak_power = lower_power + (upper_power - lower_power) * position.fract();
+                } else {
+                    peak_power = goertzel_windowed_power(samples, self.sample_rate, center, mean);
+                }
             } else {
                 for bin in first_bin..=last_bin.min(fft_len / 2) {
                     peak_power = peak_power.max(fft[bin].0 * fft[bin].0 + fft[bin].1 * fft[bin].1);
@@ -362,7 +525,7 @@ pub fn detect_chord(samples: &[f32], sample_rate: f32) -> Option<ChordEstimate> 
 mod tests {
     use super::{
         SPECTRUM_BANDS, SPECTRUM_MAX_FREQUENCY, SPECTRUM_MIN_FREQUENCY, SpectrumAnalyzer,
-        detect_chord, detect_pitch,
+        detect_chord, detect_pitch, estimate_bpm_from_envelope, estimate_bpm_from_samples,
     };
 
     #[test]
@@ -371,6 +534,48 @@ mod tests {
         let bands = SpectrumAnalyzer::new(48_000.0).analyze(&samples).unwrap();
         assert_eq!(bands.len(), SPECTRUM_BANDS);
         assert!(bands.iter().any(|value| *value > 0.0));
+    }
+
+    #[test]
+    fn bpm_detector_finds_a_regular_120_bpm_pulse() {
+        let mut envelope = vec![0.0; 2_000];
+        for index in (0..envelope.len()).step_by(50) {
+            envelope[index] = 1.0;
+        }
+        let bpm = estimate_bpm_from_envelope(&envelope, 100.0).unwrap();
+        assert!((bpm - 120.0).abs() < 2.0, "expected 120 BPM, got {bpm}");
+    }
+
+    #[test]
+    fn bpm_detector_normalizes_half_and_double_time() {
+        let mut half_time_envelope = vec![0.0; 2_000];
+        for index in (0..half_time_envelope.len()).step_by(100) {
+            half_time_envelope[index] = 1.0;
+        }
+        let half_time = estimate_bpm_from_envelope(&half_time_envelope, 100.0).unwrap();
+        assert!((half_time - 120.0).abs() < 2.0, "expected 120 BPM, got {half_time}");
+
+        let mut double_time_envelope = vec![0.0; 2_000];
+        for index in (0..double_time_envelope.len()).step_by(30) {
+            double_time_envelope[index] = 1.0;
+        }
+        let double_time = estimate_bpm_from_envelope(&double_time_envelope, 100.0).unwrap();
+        assert!((double_time - 100.0).abs() < 2.0, "expected 100 BPM, got {double_time}");
+    }
+
+    #[test]
+    fn bpm_detector_uses_spectral_attacks() {
+        let sample_rate = 8_000.0;
+        let beat_samples = (sample_rate * 60.0 / 96.0) as usize;
+        let mut samples = vec![0.0_f32; sample_rate as usize * 16];
+        for start in (0..samples.len()).step_by(beat_samples) {
+            for offset in 0..240.min(samples.len() - start) {
+                let decay = 1.0 - offset as f32 / 240.0;
+                samples[start + offset] = (offset as f32 * 0.35).sin() * decay;
+            }
+        }
+        let bpm = estimate_bpm_from_samples(&samples, sample_rate).unwrap();
+        assert!((bpm - 96.0).abs() < 2.0, "expected 96 BPM, got {bpm}");
     }
 
     #[test]

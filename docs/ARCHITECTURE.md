@@ -46,6 +46,9 @@ fournit actuellement :
   Modernisé ;
 - `analyze_with_band_count`, qui permet au Room Analyzer d'utiliser 256 bandes
   mono avec une résolution fréquentielle supérieure ;
+- `estimate_bpm_from_samples`, qui construit un flux spectral multibande sur
+  les attaques audio, puis estime le tempo par corrélation temporelle en
+  corrigeant les ambiguïtés moitié/double tempo ;
 - `detect_pitch`, qui estime la fréquence fondamentale, la note MIDI et les
   cents ;
 - `detect_chord`, qui estime la fondamentale et la qualité d'un accord à partir
@@ -54,6 +57,13 @@ fournit actuellement :
 Le sample rate et le nombre de canaux sont récupérés dans la configuration de
 l'entrée ou du fichier audio. Les flux microphone et les décodeurs sont
 assemblés dans `play-desktop` autour des buffers d'analyse.
+
+L'analyse BPM convertit jusqu'aux 120 premières secondes en mono, calcule une
+FFT par fenêtres chevauchées et pondère les attaques dans les graves, les
+médiums et les aigus. La corrélation retient un tempo dominant et normalise
+les candidats moitié/double temps. Ce résultat reste une référence unique :
+les changements de tempo et les interprétations half-time/double-time ne sont
+pas encore exposés comme une carte par section dans la liste.
 
 ### `play-ui`
 
@@ -66,12 +76,14 @@ code de rendu `egui`.
 ```mermaid
 flowchart TB
     Toolbar[Barre d'outils 38 px]
+    ModeToolbar[Barre d'outils basse contextuelle]
     Main[Zone centrale]
     Tracks[Liste Pistes\nhauteur flexible et défilement]
     Info[Informations piste\net jaquette]
     Spectrum[Analyseur spectral stéréo\n64 bandes superposées, ancré en bas]
     Stereo[Mètres LED stéréo\ngraduation dB et faders L/R]
     Toolbar --> Main
+    ModeToolbar --> Main
     Main --> Tracks
     Tracks --> Info
     Tracks --> Spectrum
@@ -90,6 +102,10 @@ tandis que les informations restent juste sous la liste et le spectre dans la
 partie basse. Le panneau droit conserve toute la hauteur disponible pour les
 mètres LED et les faders stéréo.
 
+`RoomAnalyzer` et `LiveTablature` ajoutent chacun cette barre basse avec les
+mêmes boutons texturés. Elle expose les actions propres au mode courant et
+disparaît pour `Player` et `UiLab`, afin de laisser la zone centrale libre.
+
 ## Room Analyzer
 
 Voir aussi [`ROOM_ANALYZER.md`](ROOM_ANALYZER.md) pour le détail de la capture,
@@ -103,6 +119,16 @@ extrait la fenêtre audio la plus récente, la convertit en mono et la transmet 
 Les niveaux sont affichés positivement sur une échelle de 0 à 110 dB, de 16 Hz
 à 23 kHz, et le graphe occupe toute la zone centrale du mode. Le choix de
 l'entrée et les erreurs d'ouverture sont affichés au-dessus du graphe.
+
+La barre basse permet de choisir le profil du microphone. `play-desktop` applique
+la courbe nominale ECM8000 aux bandes du Room Analyzer lorsqu'elle est active,
+avec une interpolation logarithmique ; une calibration individuelle reste la
+référence pour les mesures précises.
+
+Le signal de test est le fichier stéréo `assets/son/bruit_rose.wav`, chargé
+comme source audio en boucle lorsque le mode Room Analyzer est actif et qu'aucune
+piste ne joue. Le transport de la piste est conservé pendant le changement de
+mode ; un bandeau affiche la piste active dans Room Analyzer et Live Tablature.
 
 ## Live Tablature
 
@@ -121,7 +147,8 @@ portée classique avec cinq lignes et une clé de sol. Les deux systèmes
 partagent les mêmes positions de notes et les mêmes barres de mesure. La durée
 visible d'un système dépend de sa largeur, ce qui permet d'afficher davantage
 de notes lorsque la fenêtre est agrandie.
-`Play/Pause` suspend ou reprend le défilement et l'ajout de notes, tandis que
+La commande `Play/Pause` de la barre principale contrôle la piste audio.
+`Play/Pause` de la barre basse suspend ou reprend le défilement et l'ajout de notes, tandis que
 `Enregistrer les notes` contrôle séparément la capture des positions détectées.
 Les contrôles pédagogiques comprennent les onglets `TABLATURE` et
 `STRUMMING`, le choix de mode, le choix d'affichage, le BPM, la mesure, le
