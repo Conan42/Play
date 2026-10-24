@@ -21,13 +21,39 @@ flowchart LR
 `winit`, l'état `egui-winit`, le renderer `egui-wgpu`, la fenêtre de sélection
 de fichiers et les interactions de la toolbar.
 
+Le binaire reste volontairement réduit à `main.rs`, qui délègue le lancement à
+`app::run`. Le code de l'application est organisé dans `apps/play-desktop/src/app/`
+comme dans TacticalGlobe :
+
+- `mod.rs` contient l'état partagé, les types de session et les primitives audio
+  communes ;
+- `config.rs` contient le format `playlist.ron`, la restauration de session et
+  les réglages persistants, dont le cache des BPM ;
+- `bpm.rs` contient la lecture des métadonnées audio, l'analyse BPM en arrière-
+  plan et l'enregistrement des résultats ;
+- `core.rs` contient l'initialisation de la fenêtre, la boucle `winit` et le
+  cycle de rendu ;
+- `player.rs` contient la liste musicale, les métadonnées, la lecture, les
+  transitions et le bruit rose ;
+- `room_analyzer.rs` contient la capture microphone et l'analyse de salle ;
+- `ripper.rs` contient l'enregistrement des entrées système monitor en WAV et
+  la vue dédiée du Ripper ;
+- `live_tablature.rs` contient la détection de notes, la portée et la tablature ;
+- `backing_track.rs` contient les stems et le mixage par piste ;
+- `ui.rs` contient la toolbar, les mètres, les faders et l'assemblage des vues.
+
+Chaque fichier complète `PlayDesktop` dans son domaine avec un bloc `impl`
+séparé. Les modules utilisent les types partagés de `app::mod` sans mélanger
+les contrôles spécifiques des cinq modes.
+
 ## Bibliothèques
 
 ### `play-core`
 
 Cette crate est `no_std` avec `alloc`. Elle définit les contrats partagés :
 
-- `WorkspaceMode` : `Player`, `RoomAnalyzer`, `LiveTablature` et `UiLab` ;
+- `WorkspaceMode` : `Player`, `RoomAnalyzer`, `LiveTablature`, `BackingTrack` et
+  `Ripper` ;
 - `TransportState` : `Stopped`, `Playing` et `Paused` ;
 - `Track` et `ProjectDocument` pour la session et la liste de pistes ;
 - `SpectrumSnapshot` pour les niveaux et la crête ;
@@ -102,9 +128,26 @@ tandis que les informations restent juste sous la liste et le spectre dans la
 partie basse. Le panneau droit conserve toute la hauteur disponible pour les
 mètres LED et les faders stéréo.
 
-`RoomAnalyzer` et `LiveTablature` ajoutent chacun cette barre basse avec les
-mêmes boutons texturés. Elle expose les actions propres au mode courant et
-disparaît pour `Player` et `UiLab`, afin de laisser la zone centrale libre.
+`RoomAnalyzer`, `LiveTablature`, `BackingTrack` et `Ripper` ajoutent chacun cette barre
+d'outils contextuelle supérieure avec les mêmes boutons texturés. Elle expose les actions propres au mode
+courant et disparaît pour `Player`, qui utilise directement la barre principale
+et la liste du lecteur.
+
+`BackingTrack` démarre avec une liste de stems vide. Les stems ajoutés depuis
+le bouton dossier possèdent un nom, un rôle, un fichier, un volume, un
+panoramique, un état mute et un état solo. Les réglages de mixage sont affichés
+dans chaque ligne afin de laisser le panneau droit aux mètres des autres modes.
+La liste des stems possède des défilements horizontal et vertical pour garder
+les contrôles accessibles lorsque la fenêtre est plus étroite que la tranche
+de mixage. La synchronisation des stems s'exécute sur un thread séparé et
+publie sa progression à l'interface avant d'appliquer les décalages calculés.
+
+Le mode `Ripper` capture le sink PipeWire par défaut avec `pw-record` sous
+Linux ; sur les autres plateformes, il réutilise l'énumération des entrées
+`rodio::microphone`. `ripper.rs` écrit les échantillons reçus dans un fichier
+WAV PCM 24 bits sur un thread séparé et alimente le `LiveAnalysisBuffer` du
+graphe stéréo. Le thread est arrêté et le fichier finalisé par le bouton d'arrêt
+ou à la fermeture de l'application.
 
 ## Room Analyzer
 
@@ -120,7 +163,7 @@ Les niveaux sont affichés positivement sur une échelle de 0 à 110 dB, de 16 H
 à 23 kHz, et le graphe occupe toute la zone centrale du mode. Le choix de
 l'entrée et les erreurs d'ouverture sont affichés au-dessus du graphe.
 
-La barre basse permet de choisir le profil du microphone. `play-desktop` applique
+La barre d'outils contextuelle permet de choisir le profil du microphone. `play-desktop` applique
 la courbe nominale ECM8000 aux bandes du Room Analyzer lorsqu'elle est active,
 avec une interpolation logarithmique ; une calibration individuelle reste la
 référence pour les mesures précises.
@@ -148,7 +191,7 @@ partagent les mêmes positions de notes et les mêmes barres de mesure. La duré
 visible d'un système dépend de sa largeur, ce qui permet d'afficher davantage
 de notes lorsque la fenêtre est agrandie.
 La commande `Play/Pause` de la barre principale contrôle la piste audio.
-`Play/Pause` de la barre basse suspend ou reprend le défilement et l'ajout de notes, tandis que
+`Play/Pause` de la barre d'outils contextuelle suspend ou reprend le défilement et l'ajout de notes, tandis que
 `Enregistrer les notes` contrôle séparément la capture des positions détectées.
 Les contrôles pédagogiques comprennent les onglets `TABLATURE` et
 `STRUMMING`, le choix de mode, le choix d'affichage, le BPM, la mesure, le
@@ -199,6 +242,13 @@ première piste chargée. La piste active est surlignée dans la liste. Lorsqu'u
 FLAC contient une image intégrée, `lofty` la lit et le desktop l'affiche dans
 la zone d'informations située sous la liste.
 
+La configuration persistante est écrite dans `playlist.ron`. Elle contient une
+entrée `bpm_cache` associée au chemin de chaque fichier. Au démarrage, le
+lecteur restaure ce BPM pendant le chargement des métadonnées et évite ainsi de
+relire les échantillons pour les fichiers déjà analysés. Le cache mémorise aussi
+les analyses sans résultat ; une nouvelle analyse est lancée uniquement pour
+une piste qui n'a pas encore été analysée.
+
 ## Vérification
 
 Les commandes de validation sont :
@@ -217,5 +267,4 @@ l'audio réel, la file temporelle de tablature et la persistance des sessions.
 ## Évolutions prévues
 
 1. ajouter la connexion MIDI directe et la lecture d'exercices enregistrés ;
-2. extraire les composants Player, RoomAnalyzer et LiveTablature partageables ;
-3. valider les chemins de packaging des trois plateformes.
+2. valider les chemins de packaging des trois plateformes.

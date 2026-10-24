@@ -21,18 +21,22 @@ session démarre avec une liste de pistes vide et propose :
   38×38 et ses textures normale/enfoncée dans `assets/texture/` ;
 - les commandes menu, précédent, lecture/pause, arrêt, suivant, répétition,
   enchaînement et chargement de fichiers ;
-- le choix entre les modes `Player`, `RoomAnalyzer`, `LiveTablature` et `UiLab` ;
-- une barre d'outils inférieure qui change selon le mode : entrée audio et
+- le choix entre les modes `Player`, `RoomAnalyzer`, `LiveTablature`,
+  `BackingTrack` et `Ripper` ;
+- une barre d'outils contextuelle en haut qui change selon le mode : entrée audio et
   bruit rose, actualisation et remise à zéro pour `RoomAnalyzer`, lecture,
-  enregistrement, affichage,
-  métronome et effacement pour `LiveTablature` ;
+  enregistrement, affichage, métronome et effacement pour `LiveTablature`,
+  lecture, arrêt, ajout de stems et chargement de fichiers audio pour
+  `BackingTrack`, sélection d'une source système `Monitor` et capture WAV PCM
+  pour `Ripper` ;
 - une fenêtre de chargement permettant de sélectionner plusieurs musiques
   (`mp3`, `flac`, `wav`, `ogg`, `m4a`, `aac` et `opus`) ;
 - une analyse BPM en arrière-plan pour les fichiers qui ne déclarent pas leur
   tempo ; le résultat apparaît dans les informations de la piste avec la
-  mention `analysé` et peut être relancé depuis le menu principal. L'analyse
-  utilise le flux spectral multibande des attaques audio, avec correction des
-  ambiguïtés moitié/double tempo ;
+  mention `analysé`, est conservé dans le cache `bpm_cache` de `playlist.ron`
+  et peut être relancé depuis le menu principal. L'analyse utilise le flux
+  spectral multibande des attaques audio, avec correction des ambiguïtés
+  moitié/double tempo ;
 - une liste de pistes qui occupe l'espace disponible et défile lorsqu'elle
   devient trop longue, avec une sélection visuelle de la piste active ;
 - une zone d'informations après la liste, avec la jaquette intégrée aux FLAC ;
@@ -47,6 +51,31 @@ session démarre avec une liste de pistes vide et propose :
   panneau est aussi disponible dans Live Tablature pour régler le monitoring et
   dans Room Analyzer pour régler le bruit rose ou la piste en cours.
 
+Le mode `BackingTrack` démarre avec une liste vide. Les pistes et leurs rôles
+sont ajoutés depuis la barre d'outils et restent éditables. Chaque ligne
+fonctionne comme une tranche de DAW simplifiée : chargement du stem, mute, solo,
+volume et panoramique sont directement accessibles dans la piste, avec une
+forme d'onde compacte de l'échantillon. Les stems chargés sont
+lus ensemble sur la même sortie audio ; les vumètres et faders master restent
+ à droite et l'analyseur de spectre reste fixé en bas. Les réglages sont
+sauvegardés avec le projet `.ron` et la session. Le bouton dossier permet de
+charger une ou plusieurs pistes audio et déduit automatiquement leur nom de
+piste à partir du fichier. Le menu principal permet d'ouvrir ou de créer un
+projet BackingTrack ; une confirmation apparaît avant de perdre des
+modifications non enregistrées.
+
+La commande de synchronisation analyse les attaques en arrière-plan et affiche
+une fenêtre de progression pendant le calage des stems. Le BackingTrack reprend
+la lecture automatiquement après le calcul si elle était active avant la
+synchronisation.
+
+Le mode `Ripper` est dédié à la récupération d'une sortie audio système. Sous
+Linux, il capture directement la sortie PipeWire par défaut — par exemple la
+Scarlett — sans nécessiter une entrée `Monitor` séparée. Le navigateur doit
+être envoyé vers cette sortie, puis le mix est enregistré en WAV PCM 24 bits.
+Le fichier peut ensuite être importé comme stem dans `BackingTrack`. Le Ripper
+affiche en direct le spectre stéréo L/R et les mètres de la source capturée.
+
 Le mode `LiveTablature` propose trois présentations : `Tablature`, `Portée` et
 `Portée + tablature`. La portée classique et la tablature utilisent la même
 horloge. Les barres de mesure et les subdivisions de temps sont calculées à
@@ -55,7 +84,9 @@ partir du BPM et de la mesure 4/4 affichée dans le panneau.
 ![Capture du mode Live Tablature avec portée et tablature](docs/screenshots/live-tablature.png)
 
 Documentation détaillée : [`docs/LIVE_TABLATURE.md`](docs/LIVE_TABLATURE.md) et
-[`docs/ROOM_ANALYZER.md`](docs/ROOM_ANALYZER.md).
+[`docs/ROOM_ANALYZER.md`](docs/ROOM_ANALYZER.md) et
+[`docs/BACKING_TRACK.md`](docs/BACKING_TRACK.md) et
+[`docs/RIPPER.md`](docs/RIPPER.md).
 
 Le mode `RoomAnalyzer` ouvre une entrée audio sélectionnable et affiche un
 analyseur mono haute résolution sur 256 bandes. Sa graduation couvre 0 à
@@ -64,7 +95,7 @@ sur le signal du microphone ou de l'entrée audio choisie et utilise toute la
 zone centrale disponible. En entrant dans ce mode, Play sélectionne de
 préférence la Scarlett/Focusrite lorsqu'elle est disponible et lance un bruit
 rose sur la sortie audio par défaut lorsqu'aucune piste ne joue ; le bouton
-de volume de la barre basse permet de le couper ou de le relancer.
+de volume de la barre d'outils contextuelle permet de le couper ou de le relancer.
 
 Si la Scarlett est sélectionnée comme entrée, Play préfère aussi sa sortie
 pour le bruit rose : un casque branché sur la Scarlett peut donc servir de
@@ -79,7 +110,7 @@ augmenter le volume du bruit rose.
 étape et attend la confirmation avant de démarrer le microphone et, si
 nécessaire, le bruit rose.
 
-La barre basse du `RoomAnalyzer` propose aussi un menu de profil microphone.
+La barre d'outils contextuelle du `RoomAnalyzer` propose aussi un menu de profil microphone.
 Il permet de désactiver la correction ou de choisir `Behringer ECM8000 — courbe
 nominale`. Dans ce dernier cas, Play applique automatiquement une compensation
 spectrale interpolée aux 256 bandes avant l'affichage. Cette correction est une
@@ -108,7 +139,7 @@ réglages BPM, mesure et métronome ainsi que les commandes d'exercice et
 d'effacement. La portée classique peut être affichée seule ou avec la
 tablature, avec des barres de mesure alignées sur les deux systèmes.
 
-Sa barre basse propose aussi le profil `Shure Beta 58A — micro dynamique`.
+Sa barre d'outils contextuelle propose aussi le profil `Shure Beta 58A — micro dynamique`.
 Comme le Beta 58A est un micro dynamique branché sur l'entrée de la Scarlett,
 il ne demande pas d'alimentation fantôme 48 V ; ce profil sert à identifier le
 micro utilisé pour la capture Live Tablature.

@@ -17,7 +17,7 @@ Analyzer, tandis que l'analyseur du mode Player conserve ses deux canaux.
 
 ## Profil microphone et compensation
 
-Le bouton de réglage de la barre d'outils basse ouvre le menu `Profil du
+Le bouton de réglage de la barre d'outils contextuelle ouvre le menu `Profil du
 microphone`. Trois choix sont disponibles : `Aucune correction`, `Behringer
 ECM8000 — courbe nominale` et `Shure Beta 58A — micro dynamique`. Le profil
 ECM8000 est sélectionné par défaut pour le micro de mesure utilisé avec la
@@ -62,7 +62,7 @@ Quand l'entrée choisie est une Scarlett ou une Focusrite, Play cherche aussi
 sa sortie correspondante ; un casque branché sur la sortie casque de la
 Scarlett peut donc servir de source de test. Le graphe mesure toutefois le
 signal reçu par l'ECM8000, pas le signal envoyé directement au casque. Le
-bouton de volume de la barre d'outils basse arrête ou relance le signal de
+bouton de volume de la barre d'outils contextuelle arrête ou relance le signal de
 test ; le bouton microphone arrête ou relance la capture. Les faders du panneau
 stéréo à droite règlent le volume du bruit rose ou de la piste en cours. Si une
 piste joue déjà, elle reste audible et devient la source observée par le

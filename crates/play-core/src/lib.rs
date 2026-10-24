@@ -17,7 +17,8 @@ pub enum WorkspaceMode {
     Player,
     RoomAnalyzer,
     LiveTablature,
-    UiLab,
+    BackingTrack,
+    Ripper,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,17 +10,19 @@ name = "play"
 path = "src/main.rs"
 
 [dependencies]
-egui.workspace = true
-egui-wgpu.workspace = true
-egui-winit.workspace = true
-image.workspace = true
-lofty.workspace = true
-pollster.workspace = true
-play-core = { path = "../../crates/play-core" }
-play-media = { path = "../../crates/play-media" }
-play-ui = { path = "../../crates/play-ui" }
-rfd.workspace = true
-ron.workspace = true
-rodio.workspace = true
-serde.workspace = true
-winit.workspace = true
+egui.workspace = true # Widgets et rendu de l'interface Play.
+egui-wgpu.workspace = true # Backend WGPU de l'interface desktop.
+egui-winit.workspace = true # Liaison entre egui et la fenêtre winit.
+hound.workspace = true # Enregistrement des entrées monitor en WAV PCM.
+image.workspace = true # Chargement des images de jaquette.
+lofty.workspace = true # Lecture des tags et images intégrées des fichiers audio.
+pollster.workspace = true # Initialisation synchrone du renderer.
+play-core = { path = "../../crates/play-core" } # Modèle de session et transport partagé.
+play-media = { path = "../../crates/play-media" } # Analyse spectrale, BPM, hauteur et accords.
+play-ui = { path = "../../crates/play-ui" } # État de scène et panneaux partagés.
+rfd.workspace = true # Sélecteurs natifs de fichiers et de dossiers.
+ron.workspace = true # Persistance de playlist.ron.
+rodio.workspace = true # Moteur audio et périphériques d'entrée/sortie.
+serde.workspace = true # Sérialisation des structures de configuration.
+soundtouch.workspace = true # Time-stretch des backing tracks sans changer la hauteur.
+winit.workspace = true # Fenêtre et boucle d'événements native.

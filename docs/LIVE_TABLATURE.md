@@ -58,7 +58,7 @@ séquence de mesures.
 - `TABLATURE` et `STRUMMING` changent la vue pédagogique ;
 - la commande `Play/Pause` de la barre d'outils principale contrôle la piste
   audio et reste disponible dans ce mode ;
-- `Play/Pause` de la barre basse suspend ou reprend le défilement de la
+- `Play/Pause` de la barre d'outils contextuelle suspend ou reprend le défilement de la
   tablature et la capture ;
 - `Enregistrer les notes` contrôle l'ajout des notes dans l'historique ;
 - `Exemple immédiat`, `Nouvel exercice` et `Effacer` contrôlent l'historique ;
